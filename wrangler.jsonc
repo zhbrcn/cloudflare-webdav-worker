@@ -1,0 +1,39 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "cloudflare-webdav-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-05",
+	"workers_dev": true,
+	// For production, either keep workers.dev enabled or replace this with your own custom domain.
+	// "routes": [
+	// 	{
+	// 		"pattern": "webdav.example.com",
+	// 		"custom_domain": true
+	// 	}
+	// ],
+	"r2_buckets": [
+		{
+			"binding": "WEBDAV_BUCKET",
+			"bucket_name": "webdav-files"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "LOCKS",
+				"class_name": "WebDavLockManager"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"WebDavLockManager"
+			]
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+}
