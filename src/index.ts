@@ -93,8 +93,8 @@ export default {
 };
 
 function handleOptions() {
-  return new Response(null, {
-    status: 204,
+  return new Response("", {
+    status: 200,
     headers: {
       ...baseHeaders(),
       Allow: "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, LOCK, UNLOCK",
@@ -184,12 +184,13 @@ async function handlePut(request: Request, env: Env, path: string) {
     return new Response("Cannot write root", { status: 409, headers: baseHeaders() });
   }
 
-  const lockCheck = await ensureUnlocked(env, path, request.headers.get("If"));
+  const ifHeader = request.headers.get("If");
+  const lockCheck = await ensureUnlocked(env, path, ifHeader);
   if (lockCheck) {
     return lockCheck;
   }
 
-  await ensureParentsCreated(env, parentPath(path));
+  await ensureParentsCreated(env, parentPath(path), ifHeader);
   const existing = await env.WEBDAV_BUCKET.head(toObjectKey(path));
   await env.WEBDAV_BUCKET.put(toObjectKey(path), request.body, {
     httpMetadata: {
@@ -224,7 +225,7 @@ async function handleDelete(request: Request, env: Env, path: string) {
     await env.WEBDAV_BUCKET.delete(target.key!);
   }
 
-  return new Response(null, { status: 204, headers: baseHeaders() });
+  return new Response("", { status: 200, headers: baseHeaders() });
 }
 
 async function handleMkcol(request: Request, env: Env, path: string) {
@@ -248,7 +249,7 @@ async function handleMkcol(request: Request, env: Env, path: string) {
 
   await ensureParentExists(env, parentPath(path));
   await writeDirMarker(env, path);
-  return new Response(null, { status: 201, headers: baseHeaders() });
+  return new Response("", { status: 201, headers: baseHeaders() });
 }
 
 async function handleMove(request: Request, env: Env, sourcePath: string) {
@@ -307,8 +308,8 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
     await env.WEBDAV_BUCKET.delete(source.key!);
   }
 
-  return new Response(null, {
-    status: destinationExists ? 204 : 201,
+  return new Response("", {
+    status: destinationExists ? 200 : 201,
     headers: baseHeaders(),
   });
 }
@@ -362,8 +363,8 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
     });
   }
 
-  return new Response(null, {
-    status: destinationExists ? 204 : 201,
+  return new Response("", {
+    status: destinationExists ? 200 : 201,
     headers: baseHeaders(),
   });
 }
@@ -422,7 +423,10 @@ async function handleUnlock(request: Request, env: Env, path: string) {
   });
   const result = (await response.json()) as { ok: boolean; status: number };
 
-  return new Response(null, { status: result.status, headers: baseHeaders() });
+  return new Response("", {
+    status: result.ok ? 200 : result.status,
+    headers: baseHeaders(),
+  });
 }
 
 async function statPath(env: Env, path: string): Promise<ResourceInfo | null> {
@@ -560,7 +564,7 @@ async function ensureParentExists(env: Env, path: string) {
   }
 }
 
-async function ensureParentsCreated(env: Env, path: string) {
+async function ensureParentsCreated(env: Env, path: string, ifHeader: string | null) {
   if (path === "/") {
     return;
   }
@@ -568,7 +572,11 @@ async function ensureParentsCreated(env: Env, path: string) {
   if (existing?.isCollection) {
     return;
   }
-  await ensureParentsCreated(env, parentPath(path));
+  if (existing) {
+    throw new HttpError(409, `Parent path is not a collection: ${path}`);
+  }
+  await ensureParentsCreated(env, parentPath(path), ifHeader);
+  await assertUnlocked(env, path, ifHeader);
   await writeDirMarker(env, path);
 }
 
@@ -622,6 +630,14 @@ async function ensureUnlocked(env: Env, path: string, ifHeader: string | null, r
     return null;
   }
   return new Response("Locked", { status: result.status, headers: baseHeaders() });
+}
+
+async function assertUnlocked(env: Env, path: string, ifHeader: string | null, recursive = false) {
+  const lockCheck = await ensureUnlocked(env, path, ifHeader, recursive);
+  if (!lockCheck) {
+    return;
+  }
+  throw new HttpError(lockCheck.status, "Locked");
 }
 
 function lockStub(env: Env) {
