@@ -81,7 +81,7 @@ export class WebDavLockManager {
       return { ok: true, status: 200 as const, token: current.token, expiresAt };
     }
 
-    const conflict = this.findConflict(normalized);
+    const conflict = this.findConflict(normalized, payload.depth);
     if (conflict) {
       return { ok: false, status: 423 as const, conflict };
     }
@@ -138,11 +138,11 @@ export class WebDavLockManager {
     return null;
   }
 
-  private findConflict(path: string): LockRecord | null {
+  private findConflict(path: string, depth: "0" | "infinity"): LockRecord | null {
     for (const row of this.ctx.storage.sql.exec<LockRecord>(
       "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks",
     )) {
-      if (overlaps(row.path, row.depth, path)) {
+      if (locksConflict(row.path, row.depth, path, depth)) {
         return row;
       }
     }
@@ -170,6 +170,18 @@ function overlaps(lockPath: string, depth: "0" | "infinity", targetPath: string)
     return true;
   }
   return false;
+}
+
+function locksConflict(
+  existingPath: string,
+  existingDepth: "0" | "infinity",
+  requestedPath: string,
+  requestedDepth: "0" | "infinity",
+) {
+  return (
+    overlaps(existingPath, existingDepth, requestedPath) ||
+    overlaps(requestedPath, requestedDepth, existingPath)
+  );
 }
 
 function normalizeLockPath(path: string) {
