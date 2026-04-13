@@ -1,18 +1,8 @@
 # Cloudflare WebDAV Worker
 
-A minimal WebDAV server for Cloudflare Workers, backed by R2 for file storage and Durable Objects (SQLite) for lock management.
+Lightweight WebDAV server for Cloudflare Workers, backed by R2 for file storage and Durable Objects (SQLite) for lock management.
 
-This project is designed for:
-
-- small configuration backups
-- low concurrency WebDAV clients
-- simple self-hosted sync targets
-
-This project is not designed for:
-
-- large media libraries
-- high-concurrency collaborative editing
-- full WebDAV RFC edge-case coverage
+This project is intended for small personal backups, app sync targets, and low-concurrency self-hosted WebDAV usage. It is not intended to be a fully RFC-complete or high-concurrency WebDAV server.
 
 ## Features
 
@@ -27,18 +17,19 @@ This project is not designed for:
 - `COPY`
 - `LOCK`
 - `UNLOCK`
+- Browser directory listing and basic file management UI
+- Basic text file editing from the browser
 
 ## Architecture
 
-- Worker: handles the WebDAV protocol surface
-- R2: stores file contents
-- Durable Object (SQLite): stores WebDAV locks
+- Cloudflare Worker: WebDAV request handling and browser UI
+- R2: file/object storage
+- Durable Object with SQLite: WebDAV lock tracking
 
 ## Requirements
 
 - Node.js 20+
-- A Cloudflare account with Workers and R2 enabled
-- A Cloudflare-managed zone if you want to use a custom domain
+- Cloudflare account with Workers, R2, and Durable Objects enabled
 
 ## Quick Start
 
@@ -48,39 +39,30 @@ This project is not designed for:
 npm.cmd install
 ```
 
-2. Authenticate Wrangler.
-
-The most reliable option is a User API Token exposed as `CLOUDFLARE_API_TOKEN`.
-
-Minimum permissions:
-
-- `User` -> `Memberships` -> `Read`
-- `User` -> `User Details` -> `Read`
-- `Account` -> `Workers Scripts` -> `Edit`
-- `Account` -> `Workers R2 Storage` -> `Edit`
-- `Zone` -> `Workers Routes` -> `Edit`
-- `Zone` -> `Zone` -> `Read`
-
-3. Create the R2 bucket:
+2. Create the R2 bucket:
 
 ```powershell
 npx wrangler r2 bucket create webdav-files
 ```
 
-4. Set Basic Auth secrets:
+3. Set Basic Auth credentials:
 
 ```powershell
 npx wrangler secret put BASIC_AUTH_USER
 npx wrangler secret put BASIC_AUTH_PASS
 ```
 
+4. Review [wrangler.jsonc](./wrangler.jsonc):
+
+- set your Worker name
+- change the bucket name if needed
+- optionally configure a custom domain
+
 5. Deploy:
 
 ```powershell
 npm.cmd run deploy
 ```
-
-By default this template deploys to `workers.dev`. To use a custom domain, edit [wrangler.jsonc](/C:/Users/Brz/Desktop/webdav/wrangler.jsonc) and uncomment the `routes` block.
 
 ## Local Development
 
@@ -90,7 +72,7 @@ Run:
 npm.cmd run dev
 ```
 
-Example requests:
+Basic checks:
 
 ```powershell
 curl.exe -i -u webdav:your-password -X OPTIONS http://127.0.0.1:8787/
@@ -99,9 +81,32 @@ curl.exe -i -u webdav:your-password -T .\.dev.vars.example http://127.0.0.1:8787
 curl.exe -i -u webdav:your-password -X PROPFIND -H "Depth: 1" http://127.0.0.1:8787/config
 ```
 
-## Custom Domain Example
+Type-check:
 
-Replace the `routes` section in [wrangler.jsonc](/C:/Users/Brz/Desktop/webdav/wrangler.jsonc) with:
+```powershell
+npm.cmd run check
+```
+
+## Browser UI
+
+Opening a collection URL in a browser shows a simple file manager.
+
+Supported browser actions:
+
+- browse directories
+- upload files
+- create folders
+- rename
+- move
+- delete
+- select all / invert selection
+- basic text editing and save
+
+The browser UI is a convenience layer over the WebDAV endpoints. It is not intended to be a full replacement for dedicated sync clients.
+
+## Custom Domain
+
+Example route configuration in [wrangler.jsonc](./wrangler.jsonc):
 
 ```jsonc
 "workers_dev": false,
@@ -113,56 +118,54 @@ Replace the `routes` section in [wrangler.jsonc](/C:/Users/Brz/Desktop/webdav/wr
 ],
 ```
 
-Make sure the hostname is not already occupied by another DNS record or product.
+Then deploy again:
+
+```powershell
+npm.cmd run deploy
+```
 
 ## Notes
 
-- Empty directories are represented with a marker object in R2.
-- Parent collections must exist before uploading nested files.
-- Locking is intentionally minimal but adequate for many sync clients.
-- This implementation prefers predictable behavior over full protocol completeness.
-
-## Example Client URL
-
-```text
-https://your-worker.your-subdomain.workers.dev/
-```
-
-or with a custom domain:
-
-```text
-https://webdav.example.com/
-```
+- Empty directories are represented by a marker object in R2.
+- `PUT` can create missing parent collections to improve compatibility with some clients.
+- Locking is intentionally minimal and designed for practical compatibility, not full RFC edge-case coverage.
+- Success responses were adjusted for broader client compatibility, including clients that do not handle `204 No Content` well.
 
 ## Recommended Clients
 
 - `rclone`
 - Joplin
+- FLClash
 - password managers or note apps with basic WebDAV sync support
 
 ## Security
 
-- Use a strong random password, not a human-memorable one.
-- If you exposed a token or password during setup, rotate it immediately.
-- For stronger protection, put the Worker behind Cloudflare Access and keep Basic Auth as an app-level credential.
+- Use a strong random password.
+- Rotate any password or API token exposed during setup or testing.
+- If you need stronger access control, put the Worker behind Cloudflare Access.
+- This project uses Basic Auth and is intended for trusted personal or small-scale use.
 
 ## Known Limitations
 
 - No multi-user permission model
-- No advanced quota management
-- No optimized bulk operations for very large trees
-- WebDAV client compatibility varies; test your client before relying on it
+- No quotas or advanced storage policy
+- No transactional guarantees for large multi-object operations
+- `MOVE` / `COPY` safety is improved, but multi-object replacements are still not truly atomic
+- Client compatibility varies; test your target client before relying on it
+- Browser editing is intended for text files, not binary formats
 
 ## Project Files
 
-- [src/index.ts](/C:/Users/Brz/Desktop/webdav/src/index.ts): Worker entrypoint and WebDAV handlers
-- [src/lock-do.ts](/C:/Users/Brz/Desktop/webdav/src/lock-do.ts): Durable Object lock manager
-- [wrangler.jsonc](/C:/Users/Brz/Desktop/webdav/wrangler.jsonc): Wrangler configuration
+- [src/index.ts](./src/index.ts): Worker entrypoint, WebDAV handlers, browser UI
+- [src/lock-do.ts](./src/lock-do.ts): Durable Object lock manager
+- [wrangler.jsonc](./wrangler.jsonc): Wrangler configuration
 
 ## Publish Checklist
 
-- replace placeholder secrets
-- update the Worker name
-- update the bucket name if needed
-- configure your own custom domain if needed
-- rotate any tokens or passwords used during testing
+- set final Worker name
+- confirm bucket name
+- confirm custom domain or `workers.dev` usage
+- set final `BASIC_AUTH_USER`
+- set final `BASIC_AUTH_PASS`
+- run `npm.cmd run check`
+- run `npm.cmd run deploy`

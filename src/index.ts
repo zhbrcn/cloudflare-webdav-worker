@@ -131,7 +131,7 @@ async function handleGetLike(request: Request, env: Env, path: string) {
 
   if (resource.isCollection) {
     const children = await listChildren(env, path);
-    const body = renderDirectoryListing(path, children, request.headers.get("Authorization") ?? "");
+    const body = renderDirectoryListing(path, children);
     const headers = new Headers(baseHeaders());
     headers.set("Content-Type", "text/html; charset=utf-8");
     headers.set("Content-Length", String(new TextEncoder().encode(body).length));
@@ -260,6 +260,9 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
   if (destination === "/") {
     return new Response("Bad destination", { status: 409, headers: baseHeaders() });
   }
+  if (destination === sourcePath) {
+    return new Response("", { status: 200, headers: baseHeaders() });
+  }
 
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
   const source = await statPath(env, sourcePath);
@@ -285,28 +288,11 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
     return new Response("Destination exists", { status: 412, headers: baseHeaders() });
   }
 
-  if (destinationExists) {
-    if (destinationExists.isCollection) {
-      await deleteCollection(env, destination);
-    } else {
-      await env.WEBDAV_BUCKET.delete(destinationExists.key!);
-    }
-  }
-
   await ensureParentExists(env, parentPath(destination));
-  if (source.isCollection) {
-    await copyCollection(env, sourcePath, destination);
-    await deleteCollection(env, sourcePath);
-  } else {
-    const object = await env.WEBDAV_BUCKET.get(source.key!);
-    if (!object) {
-      return new Response("Not found", { status: 404, headers: baseHeaders() });
-    }
-    await env.WEBDAV_BUCKET.put(toObjectKey(destination), object.body, {
-      httpMetadata: object.httpMetadata,
-    });
-    await env.WEBDAV_BUCKET.delete(source.key!);
-  }
+  await withDestinationBackup(env, destination, destinationExists, async () => {
+    await copyResourcePath(env, source, sourcePath, destination);
+  });
+  await deleteResourcePath(env, sourcePath, source);
 
   return new Response("", {
     status: destinationExists ? 200 : 201,
@@ -321,6 +307,9 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
   }
   if (destination === "/") {
     return new Response("Bad destination", { status: 409, headers: baseHeaders() });
+  }
+  if (destination === sourcePath) {
+    return new Response("", { status: 200, headers: baseHeaders() });
   }
 
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
@@ -342,26 +331,10 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
     return new Response("Destination exists", { status: 412, headers: baseHeaders() });
   }
 
-  if (destinationExists) {
-    if (destinationExists.isCollection) {
-      await deleteCollection(env, destination);
-    } else {
-      await env.WEBDAV_BUCKET.delete(destinationExists.key!);
-    }
-  }
-
   await ensureParentExists(env, parentPath(destination));
-  if (source.isCollection) {
-    await copyCollection(env, sourcePath, destination);
-  } else {
-    const object = await env.WEBDAV_BUCKET.get(source.key!);
-    if (!object) {
-      return new Response("Not found", { status: 404, headers: baseHeaders() });
-    }
-    await env.WEBDAV_BUCKET.put(toObjectKey(destination), object.body, {
-      httpMetadata: object.httpMetadata,
-    });
-  }
+  await withDestinationBackup(env, destination, destinationExists, async () => {
+    await copyResourcePath(env, source, sourcePath, destination);
+  });
 
   return new Response("", {
     status: destinationExists ? 200 : 201,
@@ -618,6 +591,81 @@ async function copyCollection(env: Env, sourcePath: string, destinationPath: str
   } while (cursor);
 }
 
+async function copyFile(env: Env, sourceKey: string, destinationPath: string) {
+  const object = await env.WEBDAV_BUCKET.get(sourceKey);
+  if (!object) {
+    throw new HttpError(404, "Not found");
+  }
+  await env.WEBDAV_BUCKET.put(toObjectKey(destinationPath), object.body, {
+    httpMetadata: object.httpMetadata,
+  });
+}
+
+async function copyResourcePath(env: Env, source: ResourceInfo, sourcePath: string, destinationPath: string) {
+  if (source.isCollection) {
+    await copyCollection(env, sourcePath, destinationPath);
+    return;
+  }
+  if (!source.key) {
+    throw new HttpError(404, "Not found");
+  }
+  await copyFile(env, source.key, destinationPath);
+}
+
+async function deleteResourcePath(env: Env, path: string, resource?: ResourceInfo | null) {
+  const target = resource ?? await statPath(env, path);
+  if (!target) {
+    return;
+  }
+  if (target.isCollection) {
+    await deleteCollection(env, path);
+    return;
+  }
+  if (!target.key) {
+    throw new HttpError(404, "Not found");
+  }
+  await env.WEBDAV_BUCKET.delete(target.key);
+}
+
+function temporarySiblingPath(path: string, label: string) {
+  const parent = parentPath(path);
+  const name = basename(path) || "root";
+  const tempName = `._cf_webdav_${label}_${name}_${crypto.randomUUID()}`;
+  return parent === "/" ? `/${tempName}` : `${parent}/${tempName}`;
+}
+
+async function withDestinationBackup(
+  env: Env,
+  destinationPath: string,
+  existingDestination: ResourceInfo | null,
+  applyReplacement: () => Promise<void>,
+) {
+  if (!existingDestination) {
+    await applyReplacement();
+    return;
+  }
+
+  const backupPath = temporarySiblingPath(destinationPath, "backup");
+  await copyResourcePath(env, existingDestination, destinationPath, backupPath);
+
+  try {
+    await deleteResourcePath(env, destinationPath, existingDestination);
+    await applyReplacement();
+    await deleteResourcePath(env, backupPath);
+  } catch (error) {
+    const replacement = await statPath(env, destinationPath);
+    if (replacement) {
+      await deleteResourcePath(env, destinationPath, replacement);
+    }
+    const backup = await statPath(env, backupPath);
+    if (backup) {
+      await copyResourcePath(env, backup, backupPath, destinationPath);
+      await deleteResourcePath(env, backupPath, backup);
+    }
+    throw error;
+  }
+}
+
 async function ensureUnlocked(env: Env, path: string, ifHeader: string | null, recursive = false) {
   const token = extractLockToken(ifHeader);
   const stub = lockStub(env);
@@ -797,7 +845,7 @@ function lockDiscoveryXml(
 </D:prop>`;
 }
 
-function renderDirectoryListing(path: string, resources: ResourceInfo[], authHeader: string) {
+function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
   const title = path === "/" ? "/" : path;
   const currentDirectoryHref = encodePathForHref(ensureHref(path, true));
   const rows = resources
@@ -1162,7 +1210,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], authHea
   <script>
     const currentPath = ${safeJsonEmbed(path)};
     const currentDirectory = ${safeJsonEmbed(currentDirectoryHref)};
-    const authHeader = ${safeJsonEmbed(authHeader)};
     const statusEl = document.getElementById("status");
     const homeButton = document.getElementById("home-button");
     const uploadInput = document.getElementById("upload-input");
@@ -1208,9 +1255,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], authHea
 
     async function request(method, href, options = {}) {
       const headers = new Headers(options.headers || {});
-      if (authHeader) {
-        headers.set("Authorization", authHeader);
-      }
       const response = await fetch(href, {
         method,
         headers,
