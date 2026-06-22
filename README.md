@@ -112,7 +112,9 @@ Supported browser actions:
 - move
 - delete
 - select all / invert selection
-- basic text editing and save
+- search/filter current directory
+- drag and drop upload
+- basic text editing with Ctrl/Cmd+S, unsaved-change prompts, and in-place save
 
 The browser UI is a convenience layer over the WebDAV endpoints. It is not intended to be a full replacement for dedicated sync clients.
 
@@ -120,7 +122,7 @@ The browser UI is a convenience layer over the WebDAV endpoints. It is not inten
 
 Open `/_admin/users` in a browser and sign in with the admin credentials.
 
-For smoother browser administration, put Cloudflare Access in front of only `/_admin/*`. Do not protect the whole WebDAV hostname if you need generic WebDAV clients to keep working. When Access protects `/_admin/*`, set `ACCESS_ADMIN_EMAIL` to the allowed admin email so the Worker can trust the `Cf-Access-Authenticated-User-Email` header.
+For smoother browser administration, put Cloudflare Access in front of only `/_admin/*`. Do not protect the whole WebDAV hostname if you need generic WebDAV clients to keep working. When Access protects `/_admin/*`, set `ACCESS_ADMIN_EMAIL` to the allowed admin email so the Worker can accept the Access-injected `Cf-Access-Authenticated-User-Email` header for the management UI.
 
 The admin page can:
 
@@ -130,7 +132,7 @@ The admin page can:
 - reset passwords
 - enable or disable users
 - delete users
-- assign read/write/delete permissions
+- assign read/write/delete permissions with checkboxes
 - browse and manage each user's files through the same browser file manager
 
 Managed user passwords are hashed for authentication and also stored as AES-GCM ciphertext so the Zero Trust-protected admin UI can copy them later. If `PASSWORD_SECRET` and the Durable Object data are both exposed, stored passwords can be recovered.
@@ -172,6 +174,7 @@ npm.cmd run deploy
 - Locking is intentionally minimal and designed for practical compatibility, not full RFC edge-case coverage.
 - Success responses were adjusted for broader client compatibility, including clients that do not handle `204 No Content` well.
 - `/_admin` is reserved for browser user management and is not exposed as a WebDAV storage path.
+- The previous `/_davadmin` management alias was removed. Management routes now live only under `/_admin/*` so Cloudflare Access can protect the whole management surface.
 
 ## Recommended Clients
 
@@ -187,6 +190,9 @@ npm.cmd run deploy
 - Rotate any password or API token exposed during setup or testing.
 - If you need stronger access control, put the Worker behind Cloudflare Access.
 - This project uses Basic Auth and is intended for trusted personal or small-scale use.
+- Management write operations under `/_admin/*` require same-origin browser requests to reduce CSRF risk.
+- HTML responses include a restrictive Content Security Policy.
+- `/_admin/logout` redirects Cloudflare Access sessions to Access logout and returns `401` for Basic Auth sessions.
 
 ## Known Limitations
 

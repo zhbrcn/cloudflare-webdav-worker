@@ -4,7 +4,7 @@ import { WebDavUserManager } from "./user-do";
 const DIR_MARKER = "._cf_webdav_dir";
 const XML_NS = "DAV:";
 const ADMIN_PREFIX = "/_admin";
-const ADMIN_API_PREFIX = "/_davadmin";
+const CSRF_PROTECTED_METHODS = new Set(["POST", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "LOCK", "UNLOCK"]);
 
 interface Env {
   WEBDAV_BUCKET: R2Bucket;
@@ -56,15 +56,10 @@ export default {
       const url = new URL(request.url);
       const clientPath = normalizeRequestPath(url.pathname);
       const isAdminPath = clientPath === ADMIN_PREFIX || clientPath.startsWith(`${ADMIN_PREFIX}/`);
-      const isAdminApiPath = clientPath === ADMIN_API_PREFIX || clientPath.startsWith(`${ADMIN_API_PREFIX}/`);
       if (shouldShowRootAdmin(request, clientPath)) {
         return Response.redirect(new URL(`${ADMIN_PREFIX}/users`, request.url), 302);
       }
-      const auth = isAdminPath
-        ? await authenticateAdminRequest(request, env)
-        : isAdminApiPath
-          ? await authenticateAdminBasicRequest(request, env)
-          : await authenticateRequest(request, env);
+      const auth = isAdminPath ? await authenticateAdminRequest(request, env) : await authenticateRequest(request, env);
       if (!auth) {
         return new Response("Unauthorized", {
           status: 401,
@@ -76,9 +71,6 @@ export default {
 
       if (isAdminPath) {
         return handleAdminRequest(request, env, auth, clientPath);
-      }
-      if (isAdminApiPath) {
-        return handleAdminRequest(request, env, auth, clientPath.replace(ADMIN_API_PREFIX, ADMIN_PREFIX));
       }
 
       auth.mountPath = resolveMountPath(auth, clientPath);
@@ -178,8 +170,7 @@ async function handleGetLike(request: Request, env: Env, auth: AuthContext, path
   if (resource.isCollection) {
     const children = await listChildren(env, path);
     const body = renderDirectoryListing(path, children, auth);
-    const headers = new Headers(baseHeaders());
-    headers.set("Content-Type", "text/html; charset=utf-8");
+    const headers = new Headers(htmlHeaders());
     headers.set("Content-Length", String(new TextEncoder().encode(body).length));
 
     if (request.method.toUpperCase() === "HEAD") {
@@ -652,7 +643,7 @@ async function ensureParentExists(env: Env, path: string) {
   }
   const parent = await statPath(env, path);
   if (!parent || !parent.isCollection) {
-    throw new HttpError(409, `Parent collection does not exist: ${path}`);
+    throw new HttpError(409, "Parent collection does not exist");
   }
 }
 
@@ -673,7 +664,7 @@ async function ensureAccountRoot(env: Env, auth: AuthContext) {
     return;
   }
   if (existing) {
-    throw new HttpError(409, `Account root is not a collection: ${auth.root}`);
+    throw new HttpError(409, "Account root is not a collection");
   }
   await ensureParentsCreated(env, parentPath(auth.root), null);
   await writeDirMarker(env, auth.root);
@@ -688,7 +679,7 @@ async function ensureParentsCreated(env: Env, path: string, ifHeader: string | n
     return;
   }
   if (existing) {
-    throw new HttpError(409, `Parent path is not a collection: ${path}`);
+    throw new HttpError(409, "Parent path is not a collection");
   }
   await ensureParentsCreated(env, parentPath(path), ifHeader);
   await assertUnlocked(env, path, ifHeader);
@@ -989,147 +980,108 @@ function lockDiscoveryXml(
 </D:prop>`;
 }
 
-function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: AuthContext) {
-  const clientPath = toClientPath(auth, path);
-  const title = clientPath === "/" ? "/" : clientPath;
-  const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
-  const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
-  const pageSubtitle = isAdminFileView ? title : "WebDAV file manager";
-  const currentDirectoryHref = toClientHref(auth, path, true);
-  const rows = resources
-    .map((resource) => {
-      const href = toClientHref(auth, resource.path, resource.isCollection);
-      const name = resource.isCollection ? `${resource.name}/` : resource.name;
-      const size = resource.isCollection ? "-" : formatSize(resource.size);
-      const modified = resource.lastModified ? resource.lastModified.toISOString().replace("T", " ").replace("Z", " UTC") : "-";
-      const icon = resource.isCollection ? "DIR" : "FILE";
-      return `<tr data-href="${escapeHtml(href)}" data-name="${escapeHtml(resource.name)}" data-collection="${resource.isCollection ? "true" : "false"}" data-content-type="${escapeHtml(resource.contentType ?? "")}">
-        <td><input type="checkbox" class="row-select" aria-label="Select ${escapeHtml(name)}"></td>
-        <td class="name">
-          <div class="name-cell">
-            <span class="file-icon">${icon}</span>
-            <a class="name-text" href="${href}" title="${escapeHtml(name)}">${escapeHtml(name)}</a>
-          </div>
-        </td>
-        <td class="mono">${size}</td>
-        <td class="mono">${escapeHtml(modified)}</td>
-        <td class="actions">
-          <button type="button" data-action="open" title="Open">Open</button>
-          ${resource.isCollection ? "" : `<button type="button" data-action="edit" title="Edit">Edit</button>`}
-          <button type="button" data-action="rename" title="Rename">Ren</button>
-          <button type="button" data-action="move" title="Move">Move</button>
-          <button type="button" data-action="delete" class="danger" title="Delete">Del</button>
-        </td>
-      </tr>`;
-    })
-    .join("");
-  const parentRow = isVisibleRoot(auth, path)
-    ? ""
-    : `<tr><td></td><td class="name"><div class="name-cell"><span class="file-icon">UP</span><a class="name-text parent-link" href="${encodePathForHref(parentPath(clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(pageTitle)}</title>
-  <style>
+function renderSharedStyles() {
+  return `
     :root {
-      color-scheme: light;
-      --bg: #f6f7fb;
+      color-scheme: light dark;
+      --bg: #f4f6f8;
       --panel: #ffffff;
-      --line: #d7ddea;
-      --line-soft: #e8edf5;
-      --text: #152033;
-      --muted: #5a6b84;
-      --link: #0a5bd8;
+      --panel-soft: #f8fafc;
+      --line: #d4dae4;
+      --line-soft: #e7ebf1;
+      --text: #151b24;
+      --muted: #607086;
+      --link: #0b5cad;
       --accent: #0f766e;
-      --accent-soft: #d8f3f0;
+      --accent-soft: #d9f0ed;
       --danger: #b42318;
-      --danger-soft: #fde6e4;
+      --danger-soft: #fde7e4;
+      --shadow: 0 10px 28px rgba(15, 23, 42, 0.07);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       padding: 12px;
-      background: linear-gradient(180deg, #eef3ff 0%, #f7f9fd 100%);
+      background: var(--bg);
       color: var(--text);
-      font: 13px/1.35 "Segoe UI", system-ui, sans-serif;
+      font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+      font-feature-settings: "tnum";
     }
     main {
       max-width: 1380px;
       margin: 0 auto 0 0;
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 10px;
+      border-radius: 8px;
       overflow: hidden;
-      box-shadow: 0 10px 28px rgba(10, 25, 55, 0.06);
+      box-shadow: var(--shadow);
     }
     header {
-      padding: 12px 16px 10px;
+      padding: 0;
       border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, #fbfdff 0%, #f5f8fd 100%);
+      background: var(--panel);
     }
-    .toolbar {
+    .app-topbar {
+      min-height: 42px;
+      padding: 8px 12px;
       display: flex;
-      flex-wrap: wrap;
-      gap: 8px 12px;
-      margin-top: 8px;
-    }
-    .toolbar-group {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
       align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--line-soft);
+      background: var(--panel-soft);
+    }
+    .brand {
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .app-nav {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+    }
+    .app-nav a, .nav-button {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 4px 8px;
+      text-decoration: none;
+      font-size: 12px;
+    }
+    .app-nav a.is-active, .nav-button.is-active {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .page-heading {
+      padding: 12px 16px 10px;
+      display: grid;
+      gap: 8px;
+    }
+    .header-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
     }
     h1 {
       margin: 0 0 2px;
       font-size: 18px;
       line-height: 1.15;
-      font-weight: 600;
+      font-weight: 650;
     }
     p {
       margin: 0;
       color: var(--muted);
-      word-break: break-all;
-      font-size: 12px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    th, td {
-      padding: 6px 10px;
-      text-align: left;
-      border-bottom: 1px solid var(--line-soft);
-      vertical-align: middle;
-      white-space: nowrap;
-    }
-    th {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: #f7f9fc;
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-weight: 600;
-    }
-    tbody tr:hover {
-      background: #f8fbff;
-    }
-    tbody tr:nth-child(even) {
-      background: #fcfdff;
-    }
-    td.name {
-      width: 46%;
-      white-space: normal;
       word-break: break-word;
-    }
-    td.actions {
-      width: 20%;
-      min-width: 220px;
+      font-size: 12px;
     }
     a {
       color: var(--link);
@@ -1138,45 +1090,74 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     a:hover {
       text-decoration: underline;
     }
-    button, input[type="text"], textarea, select {
+    button, input, textarea, select {
       font: inherit;
     }
     button, .file-input-label {
       appearance: none;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--panel);
       color: var(--text);
       border-radius: 6px;
-      padding: 2px 7px;
+      padding: 4px 8px;
       cursor: pointer;
-      font-size: 11px;
+      font-size: 12px;
       line-height: 1.2;
+      min-height: 26px;
     }
-    button.primary {
+    button.primary, .file-input-label.primary {
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
     }
     button.danger {
-      border-color: #efb4ae;
+      border-color: #e7a8a1;
       color: var(--danger);
-      background: #fff;
+      background: var(--panel);
     }
-    .actions {
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    input, select, textarea {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 7px 9px;
+    }
+    input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      padding: 0;
+    }
+    .toolbar {
       display: flex;
-      flex-wrap: nowrap;
-      gap: 4px;
-      white-space: nowrap;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .toolbar-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
       align-items: center;
     }
+    .toolbar-group.selection {
+      padding-left: 10px;
+      border-left: 1px solid var(--line);
+    }
     .status {
-      padding: 7px 12px;
+      padding: 8px 12px;
       border-bottom: 1px solid var(--line);
       color: var(--muted);
-      min-height: 34px;
+      min-height: 36px;
       display: flex;
       align-items: center;
       font-size: 12px;
+      transition: background 0.16s ease, color 0.16s ease;
     }
     .status[data-tone="success"] {
       background: var(--accent-soft);
@@ -1186,13 +1167,248 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       background: var(--danger-soft);
       color: var(--danger);
     }
-    input[type="text"], textarea {
+    table {
       width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      padding: 7px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--line-soft);
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    th {
+      background: var(--panel-soft);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 650;
+    }
+    tbody tr:hover {
+      background: var(--panel-soft);
+    }
+    .mono {
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 12px;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .checks {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      min-height: 32px;
+    }
+    .checks label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--text);
+      font-size: 12px;
+      text-transform: none;
+    }
+    .breadcrumbs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .breadcrumbs a {
+      color: var(--link);
+      font-weight: 600;
+    }
+    .breadcrumbs span {
+      color: var(--muted);
+    }
+    .empty-state {
+      padding: 40px 16px;
+      text-align: center;
+      color: var(--muted);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111418;
+        --panel: #181c22;
+        --panel-soft: #202630;
+        --line: #323a46;
+        --line-soft: #27303a;
+        --text: #edf2f7;
+        --muted: #a5b2c3;
+        --link: #8ab4f8;
+        --accent: #2dd4bf;
+        --accent-soft: #123c38;
+        --danger: #ffb4a9;
+        --danger-soft: #471d1a;
+        --shadow: none;
+      }
+    }
+    @media (max-width: 760px) {
+      body { padding: 6px; }
+      .app-topbar, .header-row, .toolbar { align-items: flex-start; }
+      .app-topbar { display: grid; }
+      th, td { padding: 7px 8px; }
+      h1 { font-size: 16px; }
+    }`;
+}
+
+function renderAppTopbar(active: "files" | "users") {
+  return `<div class="app-topbar">
+        <div class="brand">WebDAV</div>
+        <nav class="app-nav" aria-label="Primary">
+          <a href="/" class="${active === "files" ? "is-active" : ""}">Files</a>
+          <a href="${ADMIN_PREFIX}/users" class="${active === "users" ? "is-active" : ""}">Users</a>
+          <a href="${ADMIN_PREFIX}/logout">Logout</a>
+        </nav>
+      </div>`;
+}
+
+function renderBreadcrumbs(auth: AuthContext, clientPath: string) {
+  const relativePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
+  const parts = relativePath.split("/").filter(Boolean);
+  const rootHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
+  const items = [`<a href="${escapeHtml(rootHref)}">Root</a>`];
+  let current = "";
+  for (const part of parts) {
+    current = `${current}/${part}`;
+    const href = auth.mountPath === "/" ? encodePathForHref(current) : `${auth.mountPath}${encodePathForHref(current)}`;
+    items.push(`<span>/</span><a href="${escapeHtml(ensureHref(href, true))}">${escapeHtml(part)}</a>`);
+  }
+  return `<nav class="breadcrumbs" aria-label="Breadcrumbs">${items.join("")}</nav>`;
+}
+
+function renderResourceIcon(isCollection: boolean, label: string) {
+  const title = isCollection ? "Directory" : label;
+  const shape = isCollection
+    ? `<path d="M3 6.5h6l1.5 2H21v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M3 6.5V5a2 2 0 0 1 2-2h4l1.5 2H19a2 2 0 0 1 2 2v1.5"/>`
+    : `<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v5h4"/>`;
+  return `<span class="file-icon" aria-label="${escapeHtml(title)}"><svg viewBox="0 0 24 24" aria-hidden="true">${shape}</svg></span>`;
+}
+
+function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: AuthContext) {
+  const clientPath = toClientPath(auth, path);
+  const title = clientPath === "/" ? "/" : clientPath;
+  const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
+  const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
+  const pageSubtitle = isAdminFileView ? title : "WebDAV file manager";
+  const currentDirectoryHref = toClientHref(auth, path, true);
+  const breadcrumbs = renderBreadcrumbs(auth, clientPath);
+  const emptyRow = resources.length === 0
+    ? `<tr><td colspan="5"><div class="empty-state">This directory is empty. Upload files or create a folder to start.</div></td></tr>`
+    : "";
+  const rows = resources
+    .map((resource) => {
+      const href = toClientHref(auth, resource.path, resource.isCollection);
+      const name = resource.isCollection ? `${resource.name}/` : resource.name;
+      const size = resource.isCollection ? "-" : formatSize(resource.size);
+      const modified = resource.lastModified ? resource.lastModified.toISOString().replace("T", " ").replace("Z", " UTC") : "-";
+      return `<tr data-href="${escapeHtml(href)}" data-name="${escapeHtml(resource.name)}" data-collection="${resource.isCollection ? "true" : "false"}" data-content-type="${escapeHtml(resource.contentType ?? "")}">
+        <td><input type="checkbox" class="row-select" aria-label="Select ${escapeHtml(name)}"></td>
+        <td class="name">
+          <div class="name-cell">
+            ${renderResourceIcon(resource.isCollection, "File")}
+            <a class="name-text" href="${href}" title="${escapeHtml(name)}">${escapeHtml(name)}</a>
+          </div>
+        </td>
+        <td class="mono">${size}</td>
+        <td class="mono">${escapeHtml(modified)}</td>
+        <td class="actions">
+          <details class="action-menu">
+            <summary aria-label="Actions for ${escapeHtml(name)}">Actions</summary>
+            <div class="action-menu-panel">
+              ${resource.isCollection ? "" : `<button type="button" data-action="edit">Edit</button>`}
+              <button type="button" data-action="rename">Rename</button>
+              <button type="button" data-action="move">Move</button>
+              <button type="button" data-action="delete" class="danger">Delete</button>
+            </div>
+          </details>
+        </td>
+      </tr>`;
+    })
+    .join("");
+  const parentRow = isVisibleRoot(auth, path)
+    ? ""
+    : `<tr><td></td><td class="name"><div class="name-cell">${renderResourceIcon(true, "Parent directory")}<a class="name-text parent-link" href="${encodePathForHref(parentPath(clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(pageTitle)}</title>
+  <style>
+    ${renderSharedStyles()}
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    td.name {
+      width: 46%;
+      white-space: normal;
+      word-break: break-word;
+    }
+    td.actions {
+      width: 10%;
+      min-width: 120px;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: nowrap;
+      gap: 4px;
+      white-space: nowrap;
+      align-items: center;
+    }
+    .action-menu {
+      position: relative;
+    }
+    .action-menu summary {
+      list-style: none;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 8px 10px;
-      background: #fff;
-      color: var(--text);
+      padding: 4px 8px;
+      cursor: pointer;
+      background: var(--panel);
+      font-size: 12px;
+      min-height: 26px;
+    }
+    .action-menu summary::-webkit-details-marker {
+      display: none;
+    }
+    .action-menu-panel {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 4px);
+      z-index: 5;
+      min-width: 128px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      display: grid;
+      gap: 4px;
+    }
+    .action-menu-panel button {
+      width: 100%;
+      text-align: left;
+      justify-content: flex-start;
+    }
+    .drop-target {
+      outline: 2px solid var(--accent);
+      outline-offset: -4px;
+    }
+    .search-input {
+      min-width: min(260px, 100%);
+    }
+    input[type="text"], textarea {
+      width: 100%;
     }
     textarea {
       min-height: 60vh;
@@ -1203,10 +1419,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     }
     input[type="file"] {
       display: none;
-    }
-    .muted {
-      color: var(--muted);
-      font-size: 12px;
     }
     .table-wrap {
       overflow-x: auto;
@@ -1227,7 +1439,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     .modal-card {
       width: min(960px, 100%);
       max-height: calc(100vh - 48px);
-      background: #fff;
+      background: var(--panel);
       border-radius: 12px;
       border: 1px solid var(--line);
       box-shadow: 0 24px 60px rgba(10, 25, 55, 0.18);
@@ -1273,14 +1485,21 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       justify-content: center;
       border: 1px solid var(--line);
       border-radius: 4px;
-      background: #f7f9fc;
+      background: var(--panel-soft);
       text-align: center;
       color: var(--muted);
       flex: 0 0 auto;
       padding: 0 4px;
-      font-size: 9px;
-      font-weight: 700;
       line-height: 1;
+    }
+    .file-icon svg {
+      width: 14px;
+      height: 14px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }
     .name-text {
       min-width: 0;
@@ -1296,15 +1515,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       font-family: Consolas, "SFMono-Regular", monospace;
       font-size: 12px;
     }
-    .row-select {
-      width: 14px;
-      height: 14px;
-      margin: 0;
-    }
     @media (max-width: 640px) {
-      body { padding: 6px; }
-      th, td { padding: 6px 8px; }
-      h1 { font-size: 16px; }
       .table-wrap { max-height: none; }
     }
   </style>
@@ -1312,20 +1523,31 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
 <body>
   <main>
     <header>
-      <h1>${escapeHtml(pageTitle)}</h1>
-      <p>${escapeHtml(pageSubtitle)}</p>
-      <div class="toolbar">
-        <div class="toolbar-group">
-          <button type="button" id="home-button">Home</button>
-          <button type="button" id="admin-button">Users</button>
-          <label class="file-input-label" for="upload-input">Upload Files</label>
+      ${renderAppTopbar("files")}
+      <div class="page-heading">
+        <div class="header-row">
+          <div>
+            <h1>${escapeHtml(pageTitle)}</h1>
+            <p>${escapeHtml(pageSubtitle)}</p>
+          </div>
+          ${breadcrumbs}
+        </div>
+        <div class="toolbar">
+          <div class="toolbar-group">
+          <label class="file-input-label primary" for="upload-input">Upload Files</label>
           <input id="upload-input" type="file" multiple>
-          <button type="button" id="new-folder-button">New Folder</button>
+          <button type="button" id="new-folder-button" class="primary">New Folder</button>
+          </div>
+          <div class="toolbar-group selection">
           <button type="button" id="select-all-button">Select All</button>
           <button type="button" id="invert-selection-button">Invert</button>
           <button type="button" id="move-selected-button">Move Selected</button>
           <button type="button" id="delete-selected-button" class="danger">Delete Selected</button>
+          </div>
+          <div class="toolbar-group">
+          <input id="search-input" class="search-input" type="search" placeholder="Search files">
           <button type="button" id="refresh-button">Refresh</button>
+          </div>
         </div>
       </div>
     </header>
@@ -1335,7 +1557,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         <thead>
           <tr><th></th><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr>
         </thead>
-        <tbody>${parentRow}${rows}</tbody>
+        <tbody>${parentRow}${rows}${emptyRow}</tbody>
       </table>
     </section>
   </main>
@@ -1369,6 +1591,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     const moveSelectedButton = document.getElementById("move-selected-button");
     const deleteSelectedButton = document.getElementById("delete-selected-button");
     const refreshButton = document.getElementById("refresh-button");
+    const searchInput = document.getElementById("search-input");
     const editorModal = document.getElementById("editor-modal");
     const closeEditorButton = document.getElementById("close-editor-button");
     const editorPath = document.getElementById("editor-path");
@@ -1376,6 +1599,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     const saveEditorButton = document.getElementById("save-editor-button");
     const clearEditorButton = document.getElementById("clear-editor-button");
     const tableBody = document.querySelector("tbody");
+    let editorDirty = false;
 
     function on(element, eventName, handler) {
       if (element) {
@@ -1405,6 +1629,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
 
     async function request(method, href, options = {}) {
       const headers = new Headers(options.headers || {});
+      headers.set("X-Requested-With", "WebDAV-Admin");
       const response = await fetch(href, {
         method,
         headers,
@@ -1550,6 +1775,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       const text = await response.text();
       editorPath.value = info.href;
       editorContent.value = text;
+      editorDirty = false;
       if (editorModal) {
         editorModal.hidden = false;
       }
@@ -1568,17 +1794,21 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         },
         body: editorContent.value,
       });
+      editorDirty = false;
       setStatus("File saved.", "success");
-      location.reload();
     }
 
     function clearEditor() {
       editorPath.value = "";
       editorContent.value = "";
+      editorDirty = false;
       setStatus("Editor cleared.");
     }
 
     function closeEditor() {
+      if (editorDirty && !window.confirm("Discard unsaved changes?")) {
+        return;
+      }
       if (editorModal) {
         editorModal.hidden = true;
       }
@@ -1658,6 +1888,26 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         uploadInput.value = "";
       }
     });
+    document.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      document.body.classList.add("drop-target");
+      setStatus("Drop files to upload.");
+    });
+    document.addEventListener("dragleave", (event) => {
+      if (event.target === document.body || event.clientX <= 0 || event.clientY <= 0) {
+        document.body.classList.remove("drop-target");
+      }
+    });
+    document.addEventListener("drop", async (event) => {
+      event.preventDefault();
+      document.body.classList.remove("drop-target");
+      const files = Array.from(event.dataTransfer?.files || []);
+      try {
+        await uploadFiles(files);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Upload failed.", "error");
+      }
+    });
 
     on(newFolderButton, "click", async () => {
       try {
@@ -1684,7 +1934,33 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
     });
     on(refreshButton, "click", () => location.reload());
+    on(searchInput, "input", () => {
+      const query = searchInput.value.trim().toLowerCase();
+      document.querySelectorAll("tbody tr[data-href]").forEach((row) => {
+        const name = (row.dataset.name || "").toLowerCase();
+        row.hidden = query.length > 0 && !name.includes(query);
+      });
+    });
     on(closeEditorButton, "click", closeEditor);
+    on(editorContent, "input", () => {
+      editorDirty = true;
+    });
+    document.addEventListener("keydown", async (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && editorModal && !editorModal.hidden) {
+        event.preventDefault();
+        try {
+          await saveEditor();
+        } catch (error) {
+          setStatus(error instanceof Error ? error.message : "Save failed.", "error");
+        }
+      }
+    });
+    window.addEventListener("beforeunload", (event) => {
+      if (editorDirty) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    });
     on(saveEditorButton, "click", async () => {
       try {
         await saveEditor();
@@ -1704,10 +1980,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
       const info = rowInfo(button);
       try {
-        if (button.dataset.action === "open") {
-          window.location.href = info.href;
-          return;
-        }
+        button.closest("details")?.removeAttribute("open");
         if (button.dataset.action === "edit") {
           await loadEditor(info);
           return;
@@ -1749,7 +2022,54 @@ function baseHeaders() {
     DAV: "1, 2",
     "MS-Author-Via": "DAV",
     "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
   };
+}
+
+function htmlHeaders() {
+  return {
+    ...baseHeaders(),
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Security-Policy": [
+      "default-src 'none'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "img-src 'self' data:",
+      "style-src 'unsafe-inline'",
+      "script-src 'unsafe-inline'",
+      "connect-src 'self'",
+    ].join("; "),
+  };
+}
+
+function validateSameOrigin(request: Request) {
+  const requestUrl = new URL(request.url);
+  const origin = request.headers.get("Origin");
+  if (origin) {
+    try {
+      return new URL(origin).origin === requestUrl.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  const referer = request.headers.get("Referer");
+  if (referer) {
+    try {
+      return new URL(referer).origin === requestUrl.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  const secFetchSite = request.headers.get("Sec-Fetch-Site");
+  return secFetchSite === "same-origin" || secFetchSite === "none";
+}
+
+function requiresAdminCsrfCheck(method: string) {
+  return CSRF_PROTECTED_METHODS.has(method);
 }
 
 function shouldShowRootAdmin(request: Request, clientPath: string) {
@@ -1964,14 +2284,32 @@ async function handleAdminRequest(request: Request, env: Env, auth: AuthContext,
   }
 
   const method = request.method.toUpperCase();
+  if (requiresAdminCsrfCheck(method) && !validateSameOrigin(request)) {
+    return new Response("CSRF check failed", { status: 403, headers: baseHeaders() });
+  }
+
+  if (method === "GET" && path === `${ADMIN_PREFIX}/logout`) {
+    if (request.headers.get("Cf-Access-Authenticated-User-Email") || request.headers.get("Cf-Access-Jwt-Assertion")) {
+      return Response.redirect(new URL("/cdn-cgi/access/logout", request.url), 302);
+    }
+    return new Response("Logged out", {
+      status: 401,
+      headers: {
+        ...baseHeaders(),
+        "WWW-Authenticate": 'Basic realm="Cloudflare WebDAV Logout"',
+      },
+    });
+  }
+
+  if (method === "GET" && path === `${ADMIN_PREFIX}/logout/access`) {
+    return Response.redirect(new URL("/cdn-cgi/access/logout", request.url), 302);
+  }
+
   if (method === "GET" && (path === ADMIN_PREFIX || path === `${ADMIN_PREFIX}/users`)) {
     const body = renderAdminUsersPage();
     return new Response(body, {
       status: 200,
-      headers: {
-        ...baseHeaders(),
-        "Content-Type": "text/html; charset=utf-8",
-      },
+      headers: htmlHeaders(),
     });
   }
 
@@ -2096,100 +2434,7 @@ function renderAdminUsersPage() {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>WebDAV Admin</title>
   <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f7fb;
-      --panel: #ffffff;
-      --line: #d7ddea;
-      --line-soft: #e8edf5;
-      --text: #152033;
-      --muted: #5a6b84;
-      --link: #0a5bd8;
-      --accent: #0f766e;
-      --accent-soft: #d8f3f0;
-      --danger: #b42318;
-      --danger-soft: #fde6e4;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 12px;
-      background: linear-gradient(180deg, #eef3ff 0%, #f7f9fd 100%);
-      color: var(--text);
-      font: 13px/1.35 "Segoe UI", system-ui, sans-serif;
-    }
-    main {
-      max-width: 1380px;
-      margin: 0 auto 0 0;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      overflow: hidden;
-      box-shadow: 0 10px 28px rgba(10, 25, 55, 0.06);
-    }
-    header {
-      padding: 12px 16px 10px;
-      border-bottom: 1px solid var(--line);
-      background: linear-gradient(180deg, #fbfdff 0%, #f5f8fd 100%);
-    }
-    .header-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-      justify-content: space-between;
-    }
-    h1 {
-      margin: 0 0 2px;
-      font-size: 18px;
-      line-height: 1.15;
-      font-weight: 600;
-    }
-    p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .toolbar {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    button, input, select {
-      font: inherit;
-    }
-    button {
-      appearance: none;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--text);
-      border-radius: 6px;
-      padding: 2px 7px;
-      cursor: pointer;
-      font-size: 11px;
-      line-height: 1.2;
-    }
-    input, select {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fff;
-      color: var(--text);
-      padding: 6px 8px;
-    }
-    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-    button.danger { color: var(--danger); border-color: #efb4ae; background: #fff; }
-    .status {
-      min-height: 34px;
-      padding: 7px 12px;
-      border-bottom: 1px solid var(--line);
-      color: var(--muted);
-      display: flex;
-      align-items: center;
-      font-size: 12px;
-    }
-    .status[data-tone="success"] { background: var(--accent-soft); color: #0b5f59; }
-    .status[data-tone="error"] { background: var(--danger-soft); color: var(--danger); }
+    ${renderSharedStyles()}
     .form {
       padding: 14px 16px;
       border-bottom: 1px solid var(--line);
@@ -2200,41 +2445,21 @@ function renderAdminUsersPage() {
     }
     .field { display: grid; gap: 4px; }
     label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-    .checks { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; min-height: 32px; }
-    .checks label { text-transform: none; font-size: 12px; color: var(--text); }
-    table { width: 100%; border-collapse: collapse; }
-    th, td {
-      padding: 6px 10px;
-      border-bottom: 1px solid var(--line-soft);
-      text-align: left;
-      vertical-align: middle;
-      white-space: nowrap;
-    }
-    th {
-      background: #f8fafc;
-      color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-      font-weight: 600;
-    }
-    tbody tr:hover { background: #f8fbff; }
-    tbody tr:nth-child(even) { background: #fcfdff; }
-    td.actions { display: flex; gap: 4px; flex-wrap: nowrap; align-items: center; }
-    .mono { font-family: Consolas, "SFMono-Regular", monospace; font-size: 12px; }
+    td.actions { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+    td.permission-cell { min-width: 210px; white-space: normal; }
     .password-box {
       margin: 14px 16px;
       padding: 10px;
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fbfcfe;
+      border-radius: 6px;
+      background: var(--panel-soft);
       display: none;
       gap: 8px;
     }
     .password-box.is-visible { display: grid; }
     .password-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     code {
-      background: #eef2f7;
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 5px 7px;
@@ -2249,14 +2474,19 @@ function renderAdminUsersPage() {
 <body>
   <main>
     <header>
-      <div class="header-row">
-        <div>
-          <h1>WebDAV Admin</h1>
-          <p>Users and managed files</p>
-        </div>
-        <div class="toolbar">
-          <button type="button" id="files-button">My Files</button>
-          <button type="button" id="refresh-button">Refresh</button>
+      ${renderAppTopbar("users")}
+      <div class="page-heading">
+        <div class="header-row">
+          <div>
+            <h1>WebDAV Admin</h1>
+            <p>Users and managed files</p>
+          </div>
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <button type="button" id="files-button">My Files</button>
+              <button type="button" id="refresh-button">Refresh</button>
+            </div>
+          </div>
         </div>
       </div>
     </header>
@@ -2312,7 +2542,7 @@ function renderAdminUsersPage() {
     async function api(path, options = {}) {
       const response = await fetch("/_admin/api" + path, {
         method: options.method || "GET",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-Requested-With": "WebDAV-Admin" },
         body: options.body ? JSON.stringify(options.body) : undefined,
       });
       const result = await response.json();
@@ -2339,6 +2569,21 @@ function renderAdminUsersPage() {
       passwordBox.classList.add("is-visible");
     }
 
+    function permissionChecks(user) {
+      const permissions = new Set(user.permissions || []);
+      return '<div class="checks">' +
+        '<label><input type="checkbox" data-permission="read"' + (permissions.has("read") ? " checked" : "") + '> Read</label>' +
+        '<label><input type="checkbox" data-permission="write"' + (permissions.has("write") ? " checked" : "") + '> Write</label>' +
+        '<label><input type="checkbox" data-permission="delete"' + (permissions.has("delete") ? " checked" : "") + '> Delete</label>' +
+      '</div>';
+    }
+
+    function rowPermissions(row) {
+      return Array.from(row.querySelectorAll("[data-permission]"))
+        .filter((input) => input.checked)
+        .map((input) => input.dataset.permission);
+    }
+
     async function copyText(value, label) {
       await navigator.clipboard.writeText(value);
       setStatus(label + " copied.", "success");
@@ -2351,7 +2596,7 @@ function renderAdminUsersPage() {
         return '<tr data-user="' + escapeHtml(user.username) + '">' +
           '<td class="mono">' + escapeHtml(user.username) + '</td>' +
           '<td class="mono">' + escapeHtml(user.root) + '</td>' +
-          '<td><input data-field="permissions" value="' + escapeHtml(user.permissions.join(",")) + '"></td>' +
+          '<td class="permission-cell">' + permissionChecks(user) + '</td>' +
           '<td><select data-field="enabled"><option value="true"' + (user.enabled ? " selected" : "") + '>yes</option><option value="false"' + (!user.enabled ? " selected" : "") + '>no</option></select></td>' +
           '<td class="mono">' + escapeHtml(fmtTime(user.lastUsedAt)) + '</td>' +
           '<td class="actions"><button data-action="files">Files</button><button data-action="copy-user">Copy User</button><button data-action="copy-password">Copy Password</button><button data-action="save">Save</button><button data-action="reset">Reset Password</button><button data-action="delete" class="danger">Delete</button></td>' +
@@ -2409,7 +2654,7 @@ function renderAdminUsersPage() {
             method: "POST",
             body: {
               username,
-              permissions: row.querySelector('[data-field="permissions"]').value.split(",").map((v) => v.trim()).filter(Boolean),
+              permissions: rowPermissions(row),
               enabled: row.querySelector('[data-field="enabled"]').value === "true",
             },
           });
