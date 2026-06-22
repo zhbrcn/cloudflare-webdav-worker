@@ -14,6 +14,14 @@ interface UserRecord {
   passwordCiphertext: string | null;
 }
 
+interface AuthAttemptRecord {
+  [key: string]: SqlStorageValue;
+  attemptKey: string;
+  failures: number;
+  lockedUntil: number;
+  updatedAt: number;
+}
+
 interface PublicUser {
   username: string;
   root: string;
@@ -80,6 +88,14 @@ export class WebDavUserManager {
     if (!columns.has("password_ciphertext")) {
       this.ctx.storage.sql.exec("ALTER TABLE users ADD COLUMN password_ciphertext TEXT");
     }
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS auth_attempt_records (
+        attempt_key TEXT PRIMARY KEY,
+        failures INTEGER NOT NULL,
+        locked_until INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -88,8 +104,8 @@ export class WebDavUserManager {
       const method = request.method.toUpperCase();
 
       if (method === "POST" && url.pathname === "/authenticate") {
-        const payload = (await request.json()) as { username: string; password: string };
-        return Response.json(await this.authenticate(payload.username, payload.password));
+        const payload = (await request.json()) as { username: string; password: string; rateLimitKey?: string };
+        return Response.json(await this.authenticate(payload.username, payload.password, payload.rateLimitKey));
       }
 
       if (method === "GET" && url.pathname === "/users") {
@@ -121,6 +137,11 @@ export class WebDavUserManager {
         return Response.json(this.deleteUser(payload.username));
       }
 
+      if (method === "POST" && url.pathname === "/audit") {
+        const payload = (await request.json()) as { actor?: string; action?: string; target?: string };
+        return Response.json(this.recordAuditEvent(payload.actor, payload.action, payload.target));
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Request failed";
@@ -128,15 +149,25 @@ export class WebDavUserManager {
     }
   }
 
-  private async authenticate(username: string, password: string) {
+  private async authenticate(username: string, password: string, rateLimitKeyInput?: string) {
+    const usernameKey = normalizeUsername(username) || "unknown";
+    const rateLimitKey = normalizeRateLimitKey(rateLimitKeyInput, usernameKey);
+    const rateLimit = this.checkRateLimit(rateLimitKey);
+    if (!rateLimit.ok) {
+      return { ok: false, status: 429 as const, retryAfter: rateLimit.retryAfter };
+    }
+
     const user = this.getUser(username);
     if (!user || !user.enabled) {
+      this.recordAuthFailure(rateLimitKey);
       return { ok: false, status: 401 as const };
     }
     const passwordHash = await hashPassword(password, user.salt);
     if (!timingSafeEquals(passwordHash, user.passwordHash)) {
+      this.recordAuthFailure(rateLimitKey);
       return { ok: false, status: 401 as const };
     }
+    this.clearAuthFailures(rateLimitKey);
     this.ctx.storage.sql.exec(
       "UPDATE users SET last_used_at = ?1 WHERE username = ?2",
       Date.now(),
@@ -279,6 +310,68 @@ export class WebDavUserManager {
     return { ok: true, status: 200 as const };
   }
 
+  private recordAuditEvent(actorInput?: string, actionInput?: string, targetInput?: string) {
+    const actor = normalizeAuditValue(actorInput || "unknown", 160);
+    const action = normalizeAuditValue(actionInput || "unknown", 80);
+    const target = normalizeAuditValue(targetInput || "", 160);
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)",
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO audit_events (ts, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
+      Date.now(),
+      actor,
+      action,
+      target,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM audit_events WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT 500)",
+    );
+    return { ok: true, status: 200 as const };
+  }
+
+  private checkRateLimit(key: string) {
+    this.cleanupAuthAttempts();
+    const now = Date.now();
+    const row = this.getAuthAttempt(key);
+    if (row?.lockedUntil && row.lockedUntil > now) {
+      return { ok: false, retryAfter: Math.ceil((row.lockedUntil - now) / 1000) };
+    }
+    return { ok: true };
+  }
+
+  private recordAuthFailure(key: string) {
+    const now = Date.now();
+    const row = this.getAuthAttempt(key);
+    const failures = (row?.updatedAt && now - row.updatedAt < 10 * 60_000 ? row.failures : 0) + 1;
+    const lockedUntil = failures >= 10 ? now + 5 * 60_000 : 0;
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO auth_attempt_records (attempt_key, failures, locked_until, updated_at) VALUES (?1, ?2, ?3, ?4)",
+      key,
+      failures,
+      lockedUntil,
+      now,
+    );
+  }
+
+  private clearAuthFailures(key: string) {
+    this.ctx.storage.sql.exec("DELETE FROM auth_attempt_records WHERE attempt_key = ?1", key);
+  }
+
+  private cleanupAuthAttempts() {
+    this.ctx.storage.sql.exec("DELETE FROM auth_attempt_records WHERE updated_at < ?1", Date.now() - 60 * 60_000);
+  }
+
+  private getAuthAttempt(key: string): AuthAttemptRecord | null {
+    for (const row of this.ctx.storage.sql.exec<AuthAttemptRecord>(
+      "SELECT attempt_key AS attemptKey, failures, locked_until AS lockedUntil, updated_at AS updatedAt FROM auth_attempt_records WHERE attempt_key = ?1",
+      key,
+    )) {
+      return row;
+    }
+    return null;
+  }
+
   private getUser(username: string): AuthenticatedStoredUser | null {
     const rows = this.ctx.storage.sql.exec<UserRecord>(
       "SELECT username, password_hash AS passwordHash, salt, root, permissions, enabled, created_at AS createdAt, updated_at AS updatedAt, last_used_at AS lastUsedAt, password_ciphertext AS passwordCiphertext FROM users WHERE username = ?1",
@@ -317,6 +410,15 @@ function normalizeUsername(value: string) {
     return "";
   }
   return normalized;
+}
+
+function normalizeRateLimitKey(value: string | undefined, username: string) {
+  const raw = value || username || "unknown";
+  return raw.trim().toLowerCase().replace(/[^a-z0-9:._|/-]/g, "").slice(0, 180) || "unknown";
+}
+
+function normalizeAuditValue(value: string, maxLength: number) {
+  return value.replace(/[\r\n\t]/g, " ").trim().slice(0, maxLength);
 }
 
 function rootForUsername(username: string) {

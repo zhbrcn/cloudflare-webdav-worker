@@ -57,11 +57,14 @@ npx wrangler secret put BASIC_AUTH_PASS
 npx wrangler secret put ADMIN_AUTH_USER
 npx wrangler secret put ADMIN_AUTH_PASS
 npx wrangler secret put ACCESS_ADMIN_EMAIL
+npx wrangler secret put ACCESS_TEAM_DOMAIN
+npx wrangler secret put ACCESS_AUD
 npx wrangler secret put PASSWORD_SECRET
 ```
 
 `ADMIN_AUTH_USER` / `ADMIN_AUTH_PASS` are used for browser user management. If they are not set, the Worker falls back to `BASIC_AUTH_USER` / `BASIC_AUTH_PASS`.
 `ACCESS_ADMIN_EMAIL` optionally allows Cloudflare Access-authenticated browser sessions to use the admin UI without Basic Auth.
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` enable verification of `Cf-Access-Jwt-Assertion` before accepting the Access email identity. Keep Cloudflare Access in front of `/_admin/*`; the Worker falls back to the Access-injected email header only when JWT settings are not configured.
 `PASSWORD_SECRET` encrypts recoverable per-user passwords for the admin UI.
 
 4. Review [wrangler.jsonc](./wrangler.jsonc):
@@ -193,6 +196,8 @@ npm.cmd run deploy
 - Management write operations under `/_admin/*` require same-origin browser requests to reduce CSRF risk.
 - HTML responses include a restrictive Content Security Policy.
 - `/_admin/logout` redirects Cloudflare Access sessions to Access logout and returns `401` for Basic Auth sessions.
+- Managed-user Basic Auth failures are rate-limited after repeated bad passwords.
+- Sensitive admin actions such as password reveal, password reset, create, update, and delete are recorded in the User Durable Object audit log.
 
 ## Known Limitations
 
@@ -220,6 +225,8 @@ npm.cmd run deploy
 - set final `ADMIN_AUTH_USER`
 - set final `ADMIN_AUTH_PASS`
 - set final `ACCESS_ADMIN_EMAIL`
+- set final `ACCESS_TEAM_DOMAIN`
+- set final `ACCESS_AUD`
 - set final `PASSWORD_SECRET`
 - run `npm.cmd run check`
 - run `npm.cmd run deploy`

@@ -5,6 +5,11 @@ const DIR_MARKER = "._cf_webdav_dir";
 const XML_NS = "DAV:";
 const ADMIN_PREFIX = "/_admin";
 const CSRF_PROTECTED_METHODS = new Set(["POST", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "LOCK", "UNLOCK"]);
+const ACCESS_JWKS_CACHE_TTL_MS = 60 * 60_000;
+
+type AccessJsonWebKey = JsonWebKey & { kid?: string };
+
+let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number } | null = null;
 
 interface Env {
   WEBDAV_BUCKET: R2Bucket;
@@ -15,9 +20,19 @@ interface Env {
   ADMIN_AUTH_USER?: string;
   ADMIN_AUTH_PASS?: string;
   ACCESS_ADMIN_EMAIL?: string;
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
 }
 
 type Permission = "read" | "write" | "delete";
+
+interface AccessJwtPayload {
+  email?: string;
+  aud?: string | string[];
+  iss?: string;
+  exp?: number;
+  nbf?: number;
+}
 
 interface AuthContext {
   username: string;
@@ -25,6 +40,7 @@ interface AuthContext {
   root: string;
   mountPath: string;
   permissions: Set<Permission>;
+  retryAfter?: number;
 }
 
 interface ResourceInfo {
@@ -65,6 +81,15 @@ export default {
           status: 401,
           headers: {
             "WWW-Authenticate": 'Basic realm="Cloudflare WebDAV"',
+          },
+        });
+      }
+      if (auth.retryAfter) {
+        return new Response("Too many failed authentication attempts", {
+          status: 429,
+          headers: {
+            ...baseHeaders(),
+            "Retry-After": String(auth.retryAfter),
           },
         });
       }
@@ -2107,10 +2132,13 @@ async function authenticateRequest(request: Request, env: Env): Promise<AuthCont
     body: JSON.stringify({
       username: credentials.user,
       password: credentials.pass,
+      rateLimitKey: rateLimitKey(request, credentials.user),
     }),
   });
   const result = (await response.json()) as {
     ok: boolean;
+    status?: number;
+    retryAfter?: number;
     user?: {
       username: string;
       root: string;
@@ -2118,6 +2146,17 @@ async function authenticateRequest(request: Request, env: Env): Promise<AuthCont
       enabled: boolean;
     };
   };
+
+  if (result.status === 429) {
+    return {
+      username: credentials.user,
+      isAdmin: false,
+      root: "/",
+      mountPath: "/",
+      permissions: new Set(),
+      retryAfter: result.retryAfter ?? 300,
+    };
+  }
 
   if (!result.ok || !result.user?.enabled) {
     return null;
@@ -2133,8 +2172,13 @@ async function authenticateRequest(request: Request, env: Env): Promise<AuthCont
 }
 
 async function authenticateAdminRequest(request: Request, env: Env): Promise<AuthContext | null> {
-  const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
+  const verifiedAccessEmail = await verifyAccessJwt(request, env);
   const allowedEmail = env.ACCESS_ADMIN_EMAIL;
+  if (verifiedAccessEmail && allowedEmail && timingSafeEquals(verifiedAccessEmail.toLowerCase(), allowedEmail.toLowerCase())) {
+    return adminAuthContext(verifiedAccessEmail);
+  }
+
+  const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
   if (accessEmail && allowedEmail && timingSafeEquals(accessEmail.toLowerCase(), allowedEmail.toLowerCase())) {
     return adminAuthContext(accessEmail);
   }
@@ -2155,6 +2199,80 @@ async function authenticateAdminBasicRequest(request: Request, env: Env): Promis
   }
 
   return null;
+}
+
+async function verifyAccessJwt(request: Request, env: Env) {
+  if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) {
+    return null;
+  }
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!token) {
+    return null;
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  try {
+    const header = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[0]))) as { alg?: string; kid?: string };
+    if (header.alg !== "RS256" || !header.kid) {
+      return null;
+    }
+    const keys = await getAccessJwks(env.ACCESS_TEAM_DOMAIN);
+    const jwk = keys.find((key) => key.kid === header.kid);
+    if (!jwk) {
+      return null;
+    }
+    const key = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const verified = await crypto.subtle.verify(
+      "RSASSA-PKCS1-v1_5",
+      key,
+      base64UrlDecode(parts[2]),
+      new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
+    );
+    if (!verified) {
+      return null;
+    }
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]))) as AccessJwtPayload;
+    const now = Math.floor(Date.now() / 1000);
+    if ((payload.exp && payload.exp <= now) || (payload.nbf && payload.nbf > now)) {
+      return null;
+    }
+    const expectedIssuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
+    if (payload.iss !== expectedIssuer) {
+      return null;
+    }
+    const audiences = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+    if (!audiences.includes(env.ACCESS_AUD)) {
+      return null;
+    }
+    return typeof payload.email === "string" ? payload.email : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getAccessJwks(teamDomain: string) {
+  const url = `https://${teamDomain}/cdn-cgi/access/certs`;
+  const now = Date.now();
+  if (accessJwksCache?.url === url && accessJwksCache.expiresAt > now) {
+    return accessJwksCache.keys;
+  }
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error("Unable to fetch Access certificates");
+  }
+  const result = (await response.json()) as { keys?: AccessJsonWebKey[] };
+  const keys = result.keys || [];
+  accessJwksCache = { url, keys, expiresAt: now + ACCESS_JWKS_CACHE_TTL_MS };
+  return keys;
 }
 
 function adminAuthContext(username: string): AuthContext {
@@ -2192,6 +2310,27 @@ function parseBasicAuth(request: Request) {
 
 function userStub(env: Env) {
   return env.USERS.get(env.USERS.idFromName("global-user-manager"));
+}
+
+function rateLimitKey(request: Request, username: string) {
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown-ip";
+  return `${ip}|${username.toLowerCase()}`;
+}
+
+async function recordAdminAudit(env: Env, actor: string, action: string, target = "") {
+  await userStub(env).fetch("https://users/audit", {
+    method: "POST",
+    body: JSON.stringify({ actor, action, target }),
+  });
+}
+
+function auditTargetFromBody(body: string) {
+  try {
+    const parsed = JSON.parse(body) as { username?: unknown };
+    return typeof parsed.username === "string" ? parsed.username : "";
+  } catch {
+    return "";
+  }
 }
 
 function requirePermission(auth: AuthContext, permission: Permission) {
@@ -2318,23 +2457,33 @@ async function handleAdminRequest(request: Request, env: Env, auth: AuthContext,
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/create` && method === "POST") {
-    return proxyUserManager(env, "/users/create", "POST", await request.text());
+    const body = await request.text();
+    await recordAdminAudit(env, auth.username, "user.create", auditTargetFromBody(body));
+    return proxyUserManager(env, "/users/create", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/update` && method === "POST") {
-    return proxyUserManager(env, "/users/update", "POST", await request.text());
+    const body = await request.text();
+    await recordAdminAudit(env, auth.username, "user.update", auditTargetFromBody(body));
+    return proxyUserManager(env, "/users/update", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/reset-password` && method === "POST") {
-    return proxyUserManager(env, "/users/reset-password", "POST", await request.text());
+    const body = await request.text();
+    await recordAdminAudit(env, auth.username, "user.reset-password", auditTargetFromBody(body));
+    return proxyUserManager(env, "/users/reset-password", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/reveal-password` && method === "POST") {
-    return proxyUserManager(env, "/users/reveal-password", "POST", await request.text());
+    const body = await request.text();
+    await recordAdminAudit(env, auth.username, "user.reveal-password", auditTargetFromBody(body));
+    return proxyUserManager(env, "/users/reveal-password", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/delete` && method === "POST") {
-    return proxyUserManager(env, "/users/delete", "POST", await request.text());
+    const body = await request.text();
+    await recordAdminAudit(env, auth.username, "user.delete", auditTargetFromBody(body));
+    return proxyUserManager(env, "/users/delete", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/files` || path.startsWith(`${ADMIN_PREFIX}/files/`)) {
@@ -2717,6 +2866,16 @@ function escapeHtml(value: string) {
 
 function safeJsonEmbed(value: string) {
   return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
+function base64UrlDecode(value: string) {
+  const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 function timingSafeEquals(left: string, right: string) {
