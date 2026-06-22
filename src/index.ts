@@ -1029,15 +1029,22 @@ function renderSharedStyles() {
     }
     button, .file-input-label {
       appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       border: 1px solid var(--line);
       background: var(--panel);
       color: var(--text);
       border-radius: 6px;
-      padding: 4px 8px;
+      padding: 0 10px;
       cursor: pointer;
       font-size: 12px;
-      line-height: 1.2;
+      line-height: 1;
       min-height: 30px;
+      height: 30px;
+      vertical-align: middle;
+      white-space: nowrap;
+      text-align: center;
     }
     button.primary, .file-input-label.primary {
       border-color: var(--accent);
