@@ -144,8 +144,8 @@ export class WebDavUserManager {
 
       return new Response("Not found", { status: 404 });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Request failed";
-      return Response.json({ ok: false, status: 400, message });
+      void error;
+      return Response.json({ ok: false, status: 400, message: "Request failed" });
     }
   }
 

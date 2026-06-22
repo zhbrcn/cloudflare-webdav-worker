@@ -136,8 +136,7 @@ export default {
           headers: baseHeaders(),
         });
       }
-      const message = error instanceof Error ? error.message : "Internal error";
-      return new Response(message, {
+      return new Response("Internal error", {
         status: 500,
         headers: baseHeaders(),
       });
@@ -1284,10 +1283,11 @@ function renderSharedStyles() {
 }
 
 function renderAppTopbar(active: "files" | "users") {
+  const filesHref = active === "users" ? `${ADMIN_PREFIX}/files` : "/";
   return `<div class="app-topbar">
         <div class="brand">WebDAV</div>
         <nav class="app-nav" aria-label="Primary">
-          <a href="/" class="${active === "files" ? "is-active" : ""}">Files</a>
+          <a href="${filesHref}" class="${active === "files" ? "is-active" : ""}">Files</a>
           <a href="${ADMIN_PREFIX}/users" class="${active === "users" ? "is-active" : ""}">Users</a>
           <a href="${ADMIN_PREFIX}/logout">Logout</a>
         </nav>
@@ -1308,6 +1308,15 @@ function renderBreadcrumbs(auth: AuthContext, clientPath: string) {
   return `<nav class="breadcrumbs" aria-label="Breadcrumbs">${items.join("")}</nav>`;
 }
 
+function parentHref(auth: AuthContext, clientPath: string) {
+  if (auth.mountPath === "/") {
+    return encodePathForHref(parentPath(clientPath));
+  }
+  const relative = stripPathPrefix(clientPath, auth.mountPath);
+  const parent = parentPath(relative);
+  return parent === "/" ? `${auth.mountPath}/` : `${auth.mountPath}${encodePathForHref(parent)}/`;
+}
+
 function renderResourceIcon(isCollection: boolean, label: string) {
   const title = isCollection ? "Directory" : label;
   const shape = isCollection
@@ -1318,6 +1327,7 @@ function renderResourceIcon(isCollection: boolean, label: string) {
 
 function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: AuthContext) {
   const clientPath = toClientPath(auth, path);
+  const visiblePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
   const title = clientPath === "/" ? "/" : clientPath;
   const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
   const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
@@ -1359,7 +1369,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     .join("");
   const parentRow = isVisibleRoot(auth, path)
     ? ""
-    : `<tr><td></td><td class="name"><div class="name-cell">${renderResourceIcon(true, "Parent directory")}<a class="name-text parent-link" href="${encodePathForHref(parentPath(clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
+    : `<tr><td></td><td class="name"><div class="name-cell">${renderResourceIcon(true, "Parent directory")}<a class="name-text parent-link" href="${escapeHtml(parentHref(auth, clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -1604,11 +1614,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     </div>
   </div>
   <script>
-    const currentPath = ${safeJsonEmbed(clientPath)};
+    const currentPath = ${safeJsonEmbed(visiblePath)};
     const currentDirectory = ${safeJsonEmbed(currentDirectoryHref)};
-    const adminButton = document.getElementById("admin-button");
+    const mountPath = ${safeJsonEmbed(auth.mountPath)};
     const statusEl = document.getElementById("status");
-    const homeButton = document.getElementById("home-button");
     const uploadInput = document.getElementById("upload-input");
     const newFolderButton = document.getElementById("new-folder-button");
     const selectAllButton = document.getElementById("select-all-button");
@@ -1624,6 +1633,8 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     const saveEditorButton = document.getElementById("save-editor-button");
     const clearEditorButton = document.getElementById("clear-editor-button");
     const tableBody = document.querySelector("tbody");
+    var RE_MULTI_SLASH = new RegExp("/{2,}", "g");
+    var RE_TRAILING_SLASH = new RegExp("/+$");
     let editorDirty = false;
 
     function on(element, eventName, handler) {
@@ -1637,6 +1648,17 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         return "/";
       }
       return path.split("/").map((part, index) => index === 0 ? "" : encodeURIComponent(part)).join("/");
+    }
+
+    function mountedHref(path) {
+      const encoded = encodePathForHref(path);
+      if (mountPath === "/") {
+        return encoded;
+      }
+      if (path === mountPath || path.startsWith(mountPath + "/")) {
+        return encoded;
+      }
+      return (mountPath + encoded).replace(RE_MULTI_SLASH, "/");
     }
 
     function setStatus(message, tone = "") {
@@ -1737,9 +1759,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       location.reload();
     }
 
-    var RE_MULTI_SLASH = new RegExp("/{2,}", "g");
-    var RE_TRAILING_SLASH = new RegExp("/+$");
-
     function normalizeDestinationPath(input) {
       var trimmed = input.trim();
       if (!trimmed) {
@@ -1750,7 +1769,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     }
 
     function buildDestinationHref(destinationDirectory, name, isCollection) {
-      var encoded = destinationDirectory === "/" ? "" : encodePathForHref(destinationDirectory);
+      var encoded = destinationDirectory === "/" ? (mountPath === "/" ? "" : mountPath) : mountedHref(destinationDirectory);
       var target = (encoded || "") + "/" + encodeURIComponent(name);
       return isCollection ? target.replace(RE_MULTI_SLASH, "/") + "/" : target.replace(RE_MULTI_SLASH, "/");
     }
@@ -1895,14 +1914,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       setStatus("Selected items deleted.", "success");
       location.reload();
     }
-
-    on(homeButton, "click", () => {
-      window.location.href = "/";
-    });
-
-    on(adminButton, "click", () => {
-      window.location.href = "/_admin/users";
-    });
 
     on(uploadInput, "change", async () => {
       try {
@@ -2090,7 +2101,11 @@ function validateSameOrigin(request: Request) {
   }
 
   const secFetchSite = request.headers.get("Sec-Fetch-Site");
-  return secFetchSite === "same-origin" || secFetchSite === "none";
+  if (secFetchSite === "same-origin") {
+    return true;
+  }
+
+  return request.headers.get("X-Requested-With") === "WebDAV-Admin";
 }
 
 function requiresAdminCsrfCheck(method: string) {
@@ -2177,6 +2192,9 @@ async function authenticateAdminRequest(request: Request, env: Env): Promise<Aut
   if (verifiedAccessEmail && allowedEmail && timingSafeEquals(verifiedAccessEmail.toLowerCase(), allowedEmail.toLowerCase())) {
     return adminAuthContext(verifiedAccessEmail);
   }
+  if (hasAccessJwtConfig(env)) {
+    return null;
+  }
 
   const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
   if (accessEmail && allowedEmail && timingSafeEquals(accessEmail.toLowerCase(), allowedEmail.toLowerCase())) {
@@ -2202,9 +2220,11 @@ async function authenticateAdminBasicRequest(request: Request, env: Env): Promis
 }
 
 async function verifyAccessJwt(request: Request, env: Env) {
-  if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) {
+  if (!hasAccessJwtConfig(env)) {
     return null;
   }
+  const teamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN!);
+  const expectedAud = env.ACCESS_AUD!;
   const token = request.headers.get("Cf-Access-Jwt-Assertion");
   if (!token) {
     return null;
@@ -2219,7 +2239,7 @@ async function verifyAccessJwt(request: Request, env: Env) {
     if (header.alg !== "RS256" || !header.kid) {
       return null;
     }
-    const keys = await getAccessJwks(env.ACCESS_TEAM_DOMAIN);
+    const keys = await getAccessJwks(teamDomain);
     const jwk = keys.find((key) => key.kid === header.kid);
     if (!jwk) {
       return null;
@@ -2245,12 +2265,12 @@ async function verifyAccessJwt(request: Request, env: Env) {
     if ((payload.exp && payload.exp <= now) || (payload.nbf && payload.nbf > now)) {
       return null;
     }
-    const expectedIssuer = `https://${env.ACCESS_TEAM_DOMAIN}`;
+    const expectedIssuer = teamDomain;
     if (payload.iss !== expectedIssuer) {
       return null;
     }
     const audiences = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
-    if (!audiences.includes(env.ACCESS_AUD)) {
+    if (!audiences.includes(expectedAud)) {
       return null;
     }
     return typeof payload.email === "string" ? payload.email : null;
@@ -2259,8 +2279,12 @@ async function verifyAccessJwt(request: Request, env: Env) {
   }
 }
 
+function hasAccessJwtConfig(env: Env) {
+  return Boolean(env.ACCESS_TEAM_DOMAIN && env.ACCESS_AUD);
+}
+
 async function getAccessJwks(teamDomain: string) {
-  const url = `https://${teamDomain}/cdn-cgi/access/certs`;
+  const url = `${teamDomain}/cdn-cgi/access/certs`;
   const now = Date.now();
   if (accessJwksCache?.url === url && accessJwksCache.expiresAt > now) {
     return accessJwksCache.keys;
@@ -2273,6 +2297,11 @@ async function getAccessJwks(teamDomain: string) {
   const keys = result.keys || [];
   accessJwksCache = { url, keys, expiresAt: now + ACCESS_JWKS_CACHE_TTL_MS };
   return keys;
+}
+
+function normalizeAccessTeamDomain(value: string) {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  return trimmed.startsWith("https://") ? trimmed : `https://${trimmed}`;
 }
 
 function adminAuthContext(username: string): AuthContext {
@@ -2498,7 +2527,9 @@ async function handleAdminFilesRequest(request: Request, env: Env, path: string)
   const parts = relative.split("/").filter(Boolean);
   const username = parts.shift();
   if (!username) {
-    return Response.redirect(new URL(`${ADMIN_PREFIX}/users`, request.url), 302);
+    const firstUser = await getFirstManagedUser(env);
+    const target = firstUser ? `${ADMIN_PREFIX}/files/${encodeURIComponent(firstUser.username)}/` : `${ADMIN_PREFIX}/users`;
+    return Response.redirect(new URL(target, request.url), 302);
   }
 
   const user = await getManagedUser(env, username);
@@ -2535,6 +2566,20 @@ async function handleAdminFilesRequest(request: Request, env: Env, path: string)
     default:
       return new Response("Method Not Allowed", { status: 405, headers: baseHeaders() });
   }
+}
+
+async function getFirstManagedUser(env: Env) {
+  const response = await userStub(env).fetch("https://users/users");
+  const result = (await response.json()) as {
+    ok: boolean;
+    users?: Array<{
+      username: string;
+      root: string;
+      permissions: Permission[];
+      enabled: boolean;
+    }>;
+  };
+  return result.users?.find((user) => user.enabled) ?? null;
 }
 
 async function getManagedUser(env: Env, username: string) {

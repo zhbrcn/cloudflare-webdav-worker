@@ -64,7 +64,7 @@ npx wrangler secret put PASSWORD_SECRET
 
 `ADMIN_AUTH_USER` / `ADMIN_AUTH_PASS` are used for browser user management. If they are not set, the Worker falls back to `BASIC_AUTH_USER` / `BASIC_AUTH_PASS`.
 `ACCESS_ADMIN_EMAIL` optionally allows Cloudflare Access-authenticated browser sessions to use the admin UI without Basic Auth.
-`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` enable verification of `Cf-Access-Jwt-Assertion` before accepting the Access email identity. Keep Cloudflare Access in front of `/_admin/*`; the Worker falls back to the Access-injected email header only when JWT settings are not configured.
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` enable verification of `Cf-Access-Jwt-Assertion` before accepting the Access email identity. `ACCESS_TEAM_DOMAIN` may be either `your-team.cloudflareaccess.com` or `https://your-team.cloudflareaccess.com`. Keep Cloudflare Access in front of `/_admin/*`; the Worker falls back to the Access-injected email header only when JWT settings are not configured.
 `PASSWORD_SECRET` encrypts recoverable per-user passwords for the admin UI.
 
 4. Review [wrangler.jsonc](./wrangler.jsonc):
