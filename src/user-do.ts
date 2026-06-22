@@ -1,4 +1,4 @@
-type Permission = "read" | "write" | "delete";
+import type { Permission } from "./types";
 
 interface UserRecord {
   [key: string]: SqlStorageValue;

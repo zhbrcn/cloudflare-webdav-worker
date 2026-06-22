@@ -1,6 +1,26 @@
 import { WebDavLockManager } from "./lock-do";
 import { WebDavUserManager } from "./user-do";
+import { ACCESS_JWKS_CACHE_TTL_MS, ADMIN_PREFIX, CSRF_PROTECTED_METHODS, DIR_MARKER, XML_NS } from "./constants";
+import { HttpError } from "./errors";
 import { baseHeaders, htmlHeaders, xmlResponse } from "./http";
+import {
+  dirMarkerKey,
+  isSameOrDescendantPath,
+  isVisibleRoot,
+  normalizeRequestPath,
+  normalizeRootPath,
+  parentDirectoryHref,
+  prefixToPath,
+  resolveMountPath,
+  stripPathPrefix,
+  temporarySiblingPath,
+  toClientHref,
+  toClientPath,
+  toCollectionPrefix,
+  toObjectKey,
+  toStoragePath,
+} from "./paths";
+import type { AccessJsonWebKey, AccessJwtPayload, AuthContext, Env, Permission, ResourceInfo } from "./types";
 import {
   basename,
   base64UrlDecode,
@@ -12,73 +32,11 @@ import {
   parentPath,
   safeJsonEmbed,
   timingSafeEquals,
-  withTrailingSlash,
 } from "./utils";
-
-const DIR_MARKER = "._cf_webdav_dir";
-const XML_NS = "DAV:";
-const ADMIN_PREFIX = "/_admin";
-const CSRF_PROTECTED_METHODS = new Set(["POST", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "LOCK", "UNLOCK"]);
-const ACCESS_JWKS_CACHE_TTL_MS = 60 * 60_000;
-
-type AccessJsonWebKey = JsonWebKey & { kid?: string };
 
 let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number } | null = null;
 
-interface Env {
-  WEBDAV_BUCKET: R2Bucket;
-  LOCKS: DurableObjectNamespace;
-  USERS: DurableObjectNamespace;
-  BASIC_AUTH_USER: string;
-  BASIC_AUTH_PASS: string;
-  ADMIN_AUTH_USER?: string;
-  ADMIN_AUTH_PASS?: string;
-  ACCESS_ADMIN_EMAIL?: string;
-  ACCESS_TEAM_DOMAIN?: string;
-  ACCESS_AUD?: string;
-}
-
-type Permission = "read" | "write" | "delete";
-
-interface AccessJwtPayload {
-  email?: string;
-  aud?: string | string[];
-  iss?: string;
-  exp?: number;
-  nbf?: number;
-}
-
-interface AuthContext {
-  username: string;
-  isAdmin: boolean;
-  root: string;
-  mountPath: string;
-  permissions: Set<Permission>;
-  retryAfter?: number;
-}
-
-interface ResourceInfo {
-  href: string;
-  name: string;
-  path: string;
-  key: string | null;
-  isCollection: boolean;
-  size: number;
-  etag: string | null;
-  lastModified: Date | null;
-  contentType: string | null;
-}
-
 export { WebDavLockManager, WebDavUserManager };
-
-class HttpError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -798,13 +756,6 @@ async function deleteResourcePath(env: Env, path: string, resource?: ResourceInf
   await env.WEBDAV_BUCKET.delete(target.key);
 }
 
-function temporarySiblingPath(path: string, label: string) {
-  const parent = parentPath(path);
-  const name = basename(path) || "root";
-  const tempName = `._cf_webdav_${label}_${name}_${crypto.randomUUID()}`;
-  return parent === "/" ? `/${tempName}` : `${parent}/${tempName}`;
-}
-
 async function withDestinationBackup(
   env: Env,
   destinationPath: string,
@@ -902,41 +853,6 @@ function extractLockToken(value: string | null) {
 
 function stripTags(value: string) {
   return value.replace(/<[^>]+>/g, "");
-}
-
-function normalizeRequestPath(pathname: string) {
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(pathname);
-  } catch {
-    throw new HttpError(400, "Invalid path");
-  }
-  const parts = decoded.split("/").filter(Boolean);
-  for (const part of parts) {
-    if (part === "." || part === "..") {
-      throw new HttpError(400, "Invalid path");
-    }
-  }
-  return parts.length === 0 ? "/" : `/${parts.join("/")}`;
-}
-
-function toObjectKey(path: string) {
-  return path.replace(/^\/+/, "");
-}
-
-function toCollectionPrefix(path: string) {
-  const key = toObjectKey(path);
-  return key.endsWith("/") ? key : `${key}/`;
-}
-
-function dirMarkerKey(path: string) {
-  const prefix = toCollectionPrefix(path);
-  return `${prefix}${DIR_MARKER}`;
-}
-
-function prefixToPath(prefix: string) {
-  const normalized = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
-  return normalized ? `/${normalized}` : "/";
 }
 
 function multistatusXml(resources: ResourceInfo[], auth: AuthContext) {
@@ -2339,83 +2255,6 @@ function requirePermission(auth: AuthContext, permission: Permission) {
   return new Response("Forbidden", { status: 403, headers: baseHeaders() });
 }
 
-function toStoragePath(auth: AuthContext, clientPath: string) {
-  if (auth.root === "/") {
-    return clientPath;
-  }
-  if (clientPath === auth.mountPath) {
-    return auth.root;
-  }
-  const relativePath = stripPathPrefix(clientPath, auth.mountPath);
-  return joinNormalizedPath(auth.root, relativePath);
-}
-
-function toClientPath(auth: AuthContext, storagePath: string) {
-  if (auth.root === "/") {
-    return storagePath;
-  }
-  if (storagePath === auth.root) {
-    return auth.mountPath;
-  }
-  const prefix = withTrailingSlash(auth.root);
-  if (storagePath.startsWith(prefix)) {
-    return joinNormalizedPath(auth.mountPath, `/${storagePath.slice(prefix.length)}`);
-  }
-  return auth.mountPath;
-}
-
-function toClientHref(auth: AuthContext, storagePath: string, isCollection: boolean) {
-  return encodePathForHref(ensureHref(toClientPath(auth, storagePath), isCollection));
-}
-
-function isVisibleRoot(auth: AuthContext, storagePath: string) {
-  return storagePath === auth.root;
-}
-
-function resolveMountPath(auth: AuthContext, clientPath: string) {
-  if (auth.root === "/") {
-    return "/";
-  }
-  if (clientPath === auth.root || clientPath.startsWith(withTrailingSlash(auth.root))) {
-    return auth.root;
-  }
-  return "/";
-}
-
-function stripPathPrefix(path: string, prefix: string) {
-  if (prefix === "/") {
-    return path;
-  }
-  if (path === prefix) {
-    return "/";
-  }
-  const withSlash = withTrailingSlash(prefix);
-  if (path.startsWith(withSlash)) {
-    return `/${path.slice(withSlash.length)}`;
-  }
-  return path;
-}
-
-function joinNormalizedPath(base: string, child: string) {
-  if (base === "/") {
-    return child;
-  }
-  if (child === "/") {
-    return base;
-  }
-  return `${base}${child}`;
-}
-
-function normalizeRootPath(value: string) {
-  const parts = value.split("/").filter(Boolean);
-  for (const part of parts) {
-    if (part === "." || part === "..") {
-      throw new HttpError(400, "Invalid root");
-    }
-  }
-  return parts.length === 0 ? "/" : `/${parts.join("/")}`;
-}
-
 async function handleAdminRequest(request: Request, env: Env, auth: AuthContext, path: string) {
   if (!auth.isAdmin) {
     return new Response("Forbidden", { status: 403, headers: baseHeaders() });
@@ -2956,15 +2795,6 @@ function renderAdminUsersPage() {
   </script>
 </body>
 </html>`;
-}
-
-function parentDirectoryHref(path: string) {
-  const parent = parentPath(path);
-  return ensureHref(parent, true);
-}
-
-function isSameOrDescendantPath(sourcePath: string, destinationPath: string) {
-  return destinationPath === sourcePath || destinationPath.startsWith(withTrailingSlash(sourcePath));
 }
 
 function parseRangeHeader(rangeHeader: string | null, size: number): R2Range | null | { error: true } {

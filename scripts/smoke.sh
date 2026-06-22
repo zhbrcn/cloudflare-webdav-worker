@@ -8,6 +8,15 @@ if [[ -z "${WEBDAV_SMOKE_USER:-}" || -z "${WEBDAV_SMOKE_PASS:-}" ]]; then
   exit 2
 fi
 
+anonymous_propfind_status="$(
+  curl -sS -o /dev/null -w '%{http_code}' \
+    -X PROPFIND -H 'Depth: 0' "${BASE_URL}/"
+)"
+if [[ "${anonymous_propfind_status}" != "401" ]]; then
+  echo "Anonymous PROPFIND smoke failed: ${anonymous_propfind_status}" >&2
+  exit 1
+fi
+
 propfind_status="$(
   curl -sS -o /dev/null -w '%{http_code}' \
     -u "${WEBDAV_SMOKE_USER}:${WEBDAV_SMOKE_PASS}" \
@@ -27,6 +36,16 @@ fi
 admin_status="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/_admin/users")"
 if [[ "${admin_status}" != "302" ]]; then
   echo "Admin Access smoke failed: ${admin_status}" >&2
+  exit 1
+fi
+
+legacy_admin_alias_status="$(
+  curl -sS -o /dev/null -w '%{http_code}' \
+    -u "${WEBDAV_SMOKE_USER}:${WEBDAV_SMOKE_PASS}" \
+    "${BASE_URL}/_davadmin/api/users"
+)"
+if [[ "${legacy_admin_alias_status}" == "200" ]]; then
+  echo "Legacy admin alias unexpectedly returned success." >&2
   exit 1
 fi
 
