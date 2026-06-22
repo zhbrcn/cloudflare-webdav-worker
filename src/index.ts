@@ -1095,6 +1095,9 @@ function renderSharedStyles() {
     .action-menu {
       position: relative;
     }
+    .action-menu[open] {
+      z-index: 30;
+    }
     .action-menu summary {
       list-style: none;
       border: 1px solid var(--line);
@@ -1441,19 +1444,30 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   <title>${escapeHtml(pageTitle)}</title>
   <style>
     ${renderSharedStyles()}
+    .file-app {
+      max-width: none;
+      width: 100%;
+      overflow: visible;
+    }
+    .file-app header {
+      border-top-left-radius: 8px;
+      border-top-right-radius: 8px;
+    }
     th {
       position: sticky;
       top: 0;
       z-index: 1;
     }
+    th.actions-column,
+    td.actions {
+      width: 132px;
+      min-width: 132px;
+      text-align: right;
+    }
     td.name {
-      width: 46%;
+      width: auto;
       white-space: normal;
       word-break: break-word;
-    }
-    td.actions {
-      width: 10%;
-      min-width: 120px;
     }
     .actions {
       display: flex;
@@ -1461,6 +1475,13 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       gap: 4px;
       white-space: nowrap;
       align-items: center;
+      justify-content: flex-end;
+      overflow: visible;
+    }
+    .actions .action-menu-panel {
+      right: 0;
+      left: auto;
+      min-width: 148px;
     }
     .drop-target {
       outline: 2px solid var(--accent);
@@ -1489,7 +1510,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     }
     .table-wrap {
       overflow-x: auto;
-      max-height: calc(100vh - 180px);
+      overflow-y: visible;
     }
     .file-list-header {
       border-top: 1px solid var(--line);
@@ -1636,6 +1657,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         right: 10px;
         width: auto;
         min-width: 0;
+        text-align: right;
       }
       td.mono {
         padding-left: 28px;
@@ -1655,13 +1677,14 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     }
     @media (max-width: 640px) {
       .table-wrap { max-height: none; overflow-x: visible; }
+      .file-app header { border-radius: 0; }
       .file-toolbar-label { flex: 1 1 100%; }
       .selection-count { flex: 1 1 100%; }
     }
   </style>
 </head>
 <body>
-  <main>
+  <main class="file-app">
     <header>
       ${renderAppTopbar(isAdminFileView ? "users" : "files")}
       <div class="page-heading">
@@ -1699,7 +1722,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     <section class="table-wrap">
       <table>
         <thead>
-          <tr><th></th><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr>
+          <tr><th></th><th>Name</th><th>Size</th><th>Modified</th><th class="actions-column">Actions</th></tr>
         </thead>
         <tbody>${rows}${emptyRow}</tbody>
       </table>
