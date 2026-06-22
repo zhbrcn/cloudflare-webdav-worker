@@ -1344,9 +1344,9 @@ function renderSharedStyles() {
     }`;
 }
 
-function renderAppTopbar(active: "files" | "users") {
+function renderAppTopbar(active: "files" | "users", title = "WebDAV") {
   return `<div class="app-topbar">
-        <div class="brand">WebDAV</div>
+        <div class="brand">${escapeHtml(title)}</div>
         <nav class="app-nav" aria-label="Primary">
           <a href="/" class="${active === "files" ? "is-active" : ""}">Files</a>
           <a href="${ADMIN_PREFIX}/users" class="${active === "users" ? "is-active" : ""}">Users</a>
@@ -1498,6 +1498,19 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       color: var(--muted);
       font-size: 12px;
       padding-right: 2px;
+    }
+    .search-toolbar {
+      display: grid;
+      grid-template-columns: auto minmax(180px, 320px);
+      justify-content: end;
+    }
+    .search-toolbar .search-input {
+      width: 100%;
+      min-width: 0;
+      height: 30px;
+      min-height: 30px;
+      padding-top: 0;
+      padding-bottom: 0;
     }
     input[type="text"], textarea {
       width: 100%;
@@ -1687,19 +1700,17 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       .file-app header { border-radius: 0; }
       .file-toolbar-label { flex: 1 1 100%; }
       .selection-count { flex: 1 1 100%; }
+      .search-toolbar {
+        grid-template-columns: auto minmax(0, 1fr);
+      }
     }
   </style>
 </head>
 <body>
   <main class="file-app">
     <header>
-      ${renderAppTopbar(isAdminFileView ? "users" : "files")}
+      ${renderAppTopbar(isAdminFileView ? "users" : "files", `${pageTitle} ${pageSubtitle}`)}
       <div class="page-heading">
-        <div class="header-row">
-          <div>
-            <h1>${escapeHtml(pageTitle)}${pageSubtitle ? ` <span class="muted">${escapeHtml(pageSubtitle)}</span>` : ""}</h1>
-          </div>
-        </div>
         <div class="toolbar">
           <div class="toolbar-group">
           <span class="file-toolbar-label">Current folder</span>
@@ -1714,7 +1725,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
           <button type="button" id="move-selected-button">Move Selected</button>
           <button type="button" id="delete-selected-button" class="danger">Delete Selected</button>
           </div>
-          <div class="toolbar-group">
+          <div class="toolbar-group search-toolbar">
           <button type="button" id="refresh-button">Refresh</button>
           <input id="search-input" class="search-input" type="search" placeholder="Search files">
           </div>
