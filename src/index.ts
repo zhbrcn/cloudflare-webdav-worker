@@ -942,7 +942,7 @@ function renderSharedStyles() {
     }
     main {
       max-width: 1380px;
-      margin: 0 auto 0 0;
+      margin: 0 auto;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -996,7 +996,7 @@ function renderSharedStyles() {
     .page-heading {
       padding: 12px 16px 10px;
       display: grid;
-      gap: 8px;
+      gap: 10px;
     }
     .header-row {
       display: flex;
@@ -1037,7 +1037,7 @@ function renderSharedStyles() {
       cursor: pointer;
       font-size: 12px;
       line-height: 1.2;
-      min-height: 26px;
+      min-height: 30px;
     }
     button.primary, .file-input-label.primary {
       border-color: var(--accent);
@@ -1059,6 +1059,7 @@ function renderSharedStyles() {
       background: var(--panel);
       color: var(--text);
       padding: 7px 9px;
+      min-height: 32px;
     }
     input[type="checkbox"] {
       width: 14px;
@@ -1078,6 +1079,7 @@ function renderSharedStyles() {
       flex-wrap: wrap;
       gap: 6px;
       align-items: center;
+      min-width: 0;
     }
     .toolbar-group.selection {
       padding-left: 10px;
@@ -1094,7 +1096,7 @@ function renderSharedStyles() {
       cursor: pointer;
       background: var(--panel);
       font-size: 12px;
-      min-height: 26px;
+      min-height: 30px;
     }
     .action-menu summary::-webkit-details-marker {
       display: none;
@@ -1305,13 +1307,28 @@ function renderSharedStyles() {
         --shadow: none;
       }
     }
-    @media (max-width: 760px) {
-      body { padding: 6px; }
-      .app-topbar, .header-row, .toolbar { align-items: flex-start; }
-      .app-topbar { display: grid; }
-      .toolbar { display: grid; justify-content: stretch; }
+    @media (max-width: 900px) {
+      body { padding: 8px; }
+      .toolbar { display: grid; grid-template-columns: 1fr 1fr; justify-content: stretch; align-items: stretch; }
       .toolbar-group { width: 100%; }
-      .search-input { flex: 1 1 180px; min-width: 0; }
+      .toolbar-group.selection { border-left: 0; padding-left: 0; }
+    }
+    @media (max-width: 640px) {
+      body { padding: 0; }
+      main { min-height: 100vh; border: 0; border-radius: 0; }
+      .app-topbar, .header-row, .toolbar { align-items: flex-start; }
+      .app-topbar { display: grid; gap: 8px; }
+      .app-nav { width: 100%; justify-content: flex-start; }
+      .app-nav a { min-height: 34px; padding: 6px 10px; }
+      .page-heading { padding: 12px; }
+      .toolbar { grid-template-columns: 1fr; }
+      .toolbar-group { width: 100%; }
+      .toolbar-group > button,
+      .toolbar-group > .file-input-label {
+        flex: 1 1 120px;
+      }
+      .search-input { flex: 1 1 100%; min-width: 0; }
+      .status { right: 10px; bottom: 10px; max-width: calc(100vw - 20px); }
       th, td { padding: 7px 8px; }
       h1 { font-size: 16px; }
     }`;
@@ -1555,6 +1572,26 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       font-size: 12px;
     }
     @media (max-width: 720px) {
+      .file-list-header {
+        padding: 8px 10px;
+      }
+      .context-line {
+        display: grid;
+        gap: 4px;
+        justify-content: stretch;
+      }
+      .account-pill,
+      .directory-meta {
+        width: fit-content;
+      }
+      .path-bar {
+        min-height: 36px;
+        padding: 4px;
+      }
+      .path-segment {
+        max-width: min(220px, 70vw);
+        min-height: 28px;
+      }
       table, thead, tbody, tr, td {
         display: block;
       }
@@ -1563,7 +1600,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
       tbody tr {
         position: relative;
-        padding: 9px 10px;
+        padding: 10px 10px 9px;
         border-bottom: 1px solid var(--line-soft);
       }
       td {
@@ -1573,17 +1610,17 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
       td:first-child {
         position: absolute;
-        top: 12px;
+        top: 13px;
         left: 10px;
       }
       td.name {
         width: auto;
         padding-left: 28px;
-        padding-right: 88px;
+        padding-right: 96px;
       }
       td.actions {
         position: absolute;
-        top: 9px;
+        top: 10px;
         right: 10px;
         width: auto;
         min-width: 0;
@@ -1591,13 +1628,23 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       td.mono {
         padding-left: 28px;
         color: var(--muted);
+        font-size: 11px;
       }
       .action-menu-panel {
         right: 0;
       }
+      .name-cell {
+        align-items: flex-start;
+      }
+      .name-text {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
     }
     @media (max-width: 640px) {
-      .table-wrap { max-height: none; }
+      .table-wrap { max-height: none; overflow-x: visible; }
+      .file-toolbar-label { flex: 1 1 100%; }
+      .selection-count { flex: 1 1 100%; }
     }
   </style>
 </head>
@@ -2616,6 +2663,9 @@ function renderAdminUsersPage() {
     label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
     td.actions { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
     td.permission-cell { min-width: 210px; white-space: normal; }
+    .admin-table-wrap {
+      overflow-x: auto;
+    }
     .admin-grid {
       display: grid;
       gap: 0;
@@ -2655,9 +2705,64 @@ function renderAdminUsersPage() {
       padding: 5px 7px;
       word-break: break-all;
     }
+    @media (max-width: 980px) {
+      .form {
+        grid-template-columns: minmax(160px, 1fr) minmax(220px, 1fr);
+      }
+      .form button {
+        width: fit-content;
+      }
+    }
     @media (max-width: 760px) {
       .form { grid-template-columns: 1fr; }
-      body { padding: 6px; }
+    }
+    @media (max-width: 680px) {
+      .admin-table-wrap {
+        overflow-x: visible;
+      }
+      .admin-table thead {
+        display: none;
+      }
+      .admin-table,
+      .admin-table tbody,
+      .admin-table tr,
+      .admin-table td {
+        display: block;
+        width: 100%;
+      }
+      .admin-table tr {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      .admin-table td {
+        border: 0;
+        padding: 4px 0;
+        white-space: normal;
+      }
+      .admin-table td::before {
+        content: attr(data-label);
+        display: block;
+        margin-bottom: 2px;
+        color: var(--muted);
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+      .admin-table td.actions {
+        display: flex;
+        gap: 6px;
+        padding-top: 8px;
+      }
+      .admin-table td.actions::before {
+        flex: 1 1 100%;
+      }
+      td.permission-cell {
+        min-width: 0;
+      }
+      .password-row button,
+      .audit-header button,
+      .form button {
+        width: 100%;
+      }
     }
   </style>
 </head>
@@ -2680,7 +2785,7 @@ function renderAdminUsersPage() {
         </div>
       </div>
     </header>
-    <div id="status" class="status">Loading users...</div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
     <section class="form">
       <div class="field">
         <label for="username">Username</label>
@@ -2709,8 +2814,8 @@ function renderAdminUsersPage() {
       </div>
     </section>
     <div class="admin-grid">
-      <section style="overflow-x:auto">
-        <table>
+      <section class="admin-table-wrap">
+        <table class="admin-table">
           <thead>
             <tr>
               <th>User</th><th>Directory</th><th>Permissions</th><th>Enabled</th><th>Last Used</th><th>Actions</th>
@@ -2727,8 +2832,8 @@ function renderAdminUsersPage() {
           </div>
           <button type="button" id="refresh-audit-button">Refresh Audit</button>
         </div>
-        <div style="overflow-x:auto">
-          <table>
+        <div class="admin-table-wrap">
+          <table class="admin-table audit-table">
             <thead>
               <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th></tr>
             </thead>
@@ -2747,11 +2852,24 @@ function renderAdminUsersPage() {
     const togglePasswordButton = document.getElementById("toggle-password-button");
     let currentPassword = "";
     let passwordVisible = false;
+    let statusTimer = 0;
 
     function setStatus(message, tone = "") {
+      if (!message) {
+        statusEl.classList.remove("is-visible");
+        statusEl.textContent = "";
+        statusEl.dataset.tone = "";
+        statusEl.dataset.loading = "false";
+        return;
+      }
+      window.clearTimeout(statusTimer);
       statusEl.textContent = message;
       statusEl.dataset.tone = tone;
       statusEl.dataset.loading = /ing\\b|Loading|Saving|Creating|Resetting|Deleting/.test(message) ? "true" : "false";
+      statusEl.classList.add("is-visible");
+      if (tone !== "error" && statusEl.dataset.loading !== "true") {
+        statusTimer = window.setTimeout(() => setStatus(""), 2400);
+      }
     }
 
     async function api(path, options = {}) {
@@ -2818,12 +2936,12 @@ function renderAdminUsersPage() {
       const result = await api("/users");
       usersBody.innerHTML = result.users.map((user) => {
         return '<tr data-user="' + escapeHtml(user.username) + '">' +
-          '<td class="mono">' + escapeHtml(user.username) + '</td>' +
-          '<td class="mono">' + escapeHtml(user.root) + '</td>' +
-          '<td class="permission-cell">' + permissionChecks(user) + '</td>' +
-          '<td><select data-field="enabled"><option value="true"' + (user.enabled ? " selected" : "") + '>yes</option><option value="false"' + (!user.enabled ? " selected" : "") + '>no</option></select></td>' +
-          '<td class="mono">' + escapeHtml(fmtTime(user.lastUsedAt)) + '</td>' +
-          '<td class="actions">' +
+          '<td class="mono" data-label="User">' + escapeHtml(user.username) + '</td>' +
+          '<td class="mono" data-label="Directory">' + escapeHtml(user.root) + '</td>' +
+          '<td class="permission-cell" data-label="Permissions">' + permissionChecks(user) + '</td>' +
+          '<td data-label="Enabled"><select data-field="enabled"><option value="true"' + (user.enabled ? " selected" : "") + '>yes</option><option value="false"' + (!user.enabled ? " selected" : "") + '>no</option></select></td>' +
+          '<td class="mono" data-label="Last Used">' + escapeHtml(fmtTime(user.lastUsedAt)) + '</td>' +
+          '<td class="actions" data-label="Actions">' +
             '<button data-action="save" class="primary">Save</button>' +
             '<details class="action-menu"><summary>Actions</summary><div class="action-menu-panel">' +
               '<button data-action="files">Files</button>' +
@@ -2842,10 +2960,10 @@ function renderAdminUsersPage() {
       const result = await api("/audit");
       auditBody.innerHTML = result.events.length ? result.events.map((event) => {
         return '<tr>' +
-          '<td class="mono">' + escapeHtml(fmtTime(event.ts)) + '</td>' +
-          '<td class="mono">' + escapeHtml(event.actor) + '</td>' +
-          '<td>' + escapeHtml(event.action) + '</td>' +
-          '<td class="mono">' + escapeHtml(event.target || "-") + '</td>' +
+          '<td class="mono" data-label="Time">' + escapeHtml(fmtTime(event.ts)) + '</td>' +
+          '<td class="mono" data-label="Actor">' + escapeHtml(event.actor) + '</td>' +
+          '<td data-label="Action">' + escapeHtml(event.action) + '</td>' +
+          '<td class="mono" data-label="Target">' + escapeHtml(event.target || "-") + '</td>' +
         '</tr>';
       }).join("") : '<tr><td colspan="4"><div class="empty-state">No audit events yet.</div></td></tr>';
     }
