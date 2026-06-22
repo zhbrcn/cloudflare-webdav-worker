@@ -27,6 +27,18 @@ if [[ "${propfind_status}" != "207" ]]; then
   exit 1
 fi
 
+file_page_html="$(
+  curl -sS -u "${WEBDAV_SMOKE_USER}:${WEBDAV_SMOKE_PASS}" "${BASE_URL}/"
+)"
+if [[ "${file_page_html}" != *'href="/" class="is-active">Files</a>'* ]]; then
+  echo "File page top navigation smoke failed." >&2
+  exit 1
+fi
+if [[ "${file_page_html}" != *'class="path-segment is-current" href="/" aria-current="page">Files</a>'* ]]; then
+  echo "File page path bar smoke failed." >&2
+  exit 1
+fi
+
 root_status="$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/")"
 if [[ "${root_status}" != "302" ]]; then
   echo "Root redirect smoke failed: ${root_status}" >&2

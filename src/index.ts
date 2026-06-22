@@ -1341,12 +1341,11 @@ function renderSharedStyles() {
     }`;
 }
 
-function renderAppTopbar(active: "files" | "users", filesHref = "/") {
-  const resolvedFilesHref = active === "users" ? `${ADMIN_PREFIX}/files` : filesHref;
+function renderAppTopbar(active: "files" | "users") {
   return `<div class="app-topbar">
         <div class="brand">WebDAV</div>
         <nav class="app-nav" aria-label="Primary">
-          <a href="${escapeHtml(resolvedFilesHref)}" class="${active === "files" ? "is-active" : ""}">Files</a>
+          <a href="/" class="${active === "files" ? "is-active" : ""}">Files</a>
           <a href="${ADMIN_PREFIX}/users" class="${active === "users" ? "is-active" : ""}">Users</a>
           <a href="${ADMIN_PREFIX}/logout">Logout</a>
         </nav>
@@ -1356,12 +1355,19 @@ function renderAppTopbar(active: "files" | "users", filesHref = "/") {
 function renderPathBar(auth: AuthContext, clientPath: string, itemCount: number) {
   const relativePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
   const parts = relativePath.split("/").filter(Boolean);
+  const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
   const rootHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
-  const accountLabel = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`) ? `Admin: ${auth.username}` : auth.username;
+  const accountLabel = isAdminFileView ? `Managed files: ${auth.username}` : auth.username;
   const itemLabel = `${itemCount} ${itemCount === 1 ? "item" : "items"}`;
-  const items = [
-    `<a class="path-segment ${parts.length === 0 ? "is-current" : ""}" href="${escapeHtml(rootHref)}" ${parts.length === 0 ? 'aria-current="page"' : ""}>/</a>`,
-  ];
+  const items = isAdminFileView
+    ? [
+        `<a class="path-segment" href="${ADMIN_PREFIX}/users">Users</a>`,
+        `<span class="path-separator">/</span><a class="path-segment" href="${ADMIN_PREFIX}/files">Managed files</a>`,
+        `<span class="path-separator">/</span><a class="path-segment ${parts.length === 0 ? "is-current" : ""}" href="${escapeHtml(rootHref)}" ${parts.length === 0 ? 'aria-current="page"' : ""}>${escapeHtml(auth.username)}</a>`,
+      ]
+    : [
+        `<a class="path-segment ${parts.length === 0 ? "is-current" : ""}" href="${escapeHtml(rootHref)}" ${parts.length === 0 ? 'aria-current="page"' : ""}>Files</a>`,
+      ];
   let current = "";
   for (const [index, part] of parts.entries()) {
     current = `${current}/${part}`;
@@ -1393,7 +1399,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   const pageTitle = "Files";
   const pageSubtitle = isAdminFileView ? auth.username : "WebDAV file manager";
   const currentDirectoryHref = toClientHref(auth, path, true);
-  const homeHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
   const pathBar = renderPathBar(auth, clientPath, resources.length);
   const emptyRow = resources.length === 0
     ? `<tr><td colspan="5"><div class="empty-state">This directory is empty. Upload files or create a folder to start.</div></td></tr>`
@@ -1658,7 +1663,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
 <body>
   <main>
     <header>
-      ${renderAppTopbar("files", homeHref)}
+      ${renderAppTopbar(isAdminFileView ? "users" : "files")}
       <div class="page-heading">
         <div class="header-row">
           <div>
@@ -2785,7 +2790,7 @@ function renderAdminUsersPage() {
           </div>
           <div class="toolbar">
             <div class="toolbar-group">
-              <button type="button" id="files-button">My Files</button>
+              <button type="button" id="files-button">Managed Files</button>
               <button type="button" id="refresh-button">Refresh</button>
             </div>
           </div>
