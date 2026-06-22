@@ -1119,14 +1119,25 @@ function renderSharedStyles() {
       justify-content: flex-start;
     }
     .status {
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--line);
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 20;
+      max-width: min(420px, calc(100vw - 32px));
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
       color: var(--muted);
-      min-height: 36px;
-      display: flex;
+      min-height: 34px;
+      display: none;
       align-items: center;
       font-size: 12px;
-      transition: background 0.16s ease, color 0.16s ease;
+      transition: background 0.16s ease, color 0.16s ease, opacity 0.16s ease;
+    }
+    .status.is-visible {
+      display: flex;
     }
     .status[data-tone="success"] {
       background: var(--accent-soft);
@@ -1451,6 +1462,12 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       overflow-x: auto;
       max-height: calc(100vh - 180px);
     }
+    .file-list-header {
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      background: var(--panel);
+    }
     .modal[hidden] {
       display: none;
     }
@@ -1595,7 +1612,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
             <p>${escapeHtml(pageSubtitle)}</p>
           </div>
         </div>
-        ${pathBar}
         <div class="toolbar">
           <div class="toolbar-group">
           <span class="file-toolbar-label">Current folder</span>
@@ -1617,7 +1633,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         </div>
       </div>
     </header>
-    <div id="status" class="status">Ready.</div>
+    <div id="status" class="status" role="status" aria-live="polite"></div>
+    <div class="file-list-header">
+      ${pathBar}
+    </div>
     <section class="table-wrap">
       <table>
         <thead>
@@ -1668,6 +1687,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     var RE_MULTI_SLASH = new RegExp("/{2,}", "g");
     var RE_TRAILING_SLASH = new RegExp("/+$");
     let editorDirty = false;
+    let statusTimer = 0;
 
     function on(element, eventName, handler) {
       if (element) {
@@ -1697,9 +1717,21 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       if (!statusEl) {
         return;
       }
+      if (!message) {
+        statusEl.classList.remove("is-visible");
+        statusEl.textContent = "";
+        statusEl.dataset.tone = "";
+        statusEl.dataset.loading = "false";
+        return;
+      }
+      window.clearTimeout(statusTimer);
       statusEl.textContent = message;
       statusEl.dataset.tone = tone;
       statusEl.dataset.loading = /ing\\b|Loading|Uploading|Moving|Deleting|Saving|Creating/.test(message) ? "true" : "false";
+      statusEl.classList.add("is-visible");
+      if (tone !== "error" && statusEl.dataset.loading !== "true") {
+        statusTimer = window.setTimeout(() => setStatus(""), 2400);
+      }
     }
 
     function joinPath(baseHref, name) {
@@ -2091,7 +2123,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     });
 
     updateSelectionState();
-    setStatus("UI ready.");
   </script>
 </body>
 </html>`;
