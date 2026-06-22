@@ -1,13 +1,30 @@
 import { WebDavLockManager } from "./lock-do";
+import { WebDavUserManager } from "./user-do";
 
 const DIR_MARKER = "._cf_webdav_dir";
 const XML_NS = "DAV:";
+const ADMIN_PREFIX = "/_admin";
+const ADMIN_API_PREFIX = "/_davadmin";
 
 interface Env {
   WEBDAV_BUCKET: R2Bucket;
   LOCKS: DurableObjectNamespace;
+  USERS: DurableObjectNamespace;
   BASIC_AUTH_USER: string;
   BASIC_AUTH_PASS: string;
+  ADMIN_AUTH_USER?: string;
+  ADMIN_AUTH_PASS?: string;
+  ACCESS_ADMIN_EMAIL?: string;
+}
+
+type Permission = "read" | "write" | "delete";
+
+interface AuthContext {
+  username: string;
+  isAdmin: boolean;
+  root: string;
+  mountPath: string;
+  permissions: Set<Permission>;
 }
 
 interface ResourceInfo {
@@ -22,7 +39,7 @@ interface ResourceInfo {
   contentType: string | null;
 }
 
-export { WebDavLockManager };
+export { WebDavLockManager, WebDavUserManager };
 
 class HttpError extends Error {
   readonly status: number;
@@ -36,7 +53,19 @@ class HttpError extends Error {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
-      if (!isAuthorized(request, env)) {
+      const url = new URL(request.url);
+      const clientPath = normalizeRequestPath(url.pathname);
+      const isAdminPath = clientPath === ADMIN_PREFIX || clientPath.startsWith(`${ADMIN_PREFIX}/`);
+      const isAdminApiPath = clientPath === ADMIN_API_PREFIX || clientPath.startsWith(`${ADMIN_API_PREFIX}/`);
+      if (shouldShowRootAdmin(request, clientPath)) {
+        return Response.redirect(new URL(`${ADMIN_PREFIX}/users`, request.url), 302);
+      }
+      const auth = isAdminPath
+        ? await authenticateAdminRequest(request, env)
+        : isAdminApiPath
+          ? await authenticateAdminBasicRequest(request, env)
+          : await authenticateRequest(request, env);
+      if (!auth) {
         return new Response("Unauthorized", {
           status: 401,
           headers: {
@@ -45,31 +74,38 @@ export default {
         });
       }
 
-      const url = new URL(request.url);
-      const resourcePath = normalizeRequestPath(url.pathname);
+      if (isAdminPath) {
+        return handleAdminRequest(request, env, auth, clientPath);
+      }
+      if (isAdminApiPath) {
+        return handleAdminRequest(request, env, auth, clientPath.replace(ADMIN_API_PREFIX, ADMIN_PREFIX));
+      }
+
+      auth.mountPath = resolveMountPath(auth, clientPath);
+      const resourcePath = toStoragePath(auth, clientPath);
 
       switch (request.method.toUpperCase()) {
         case "OPTIONS":
           return handleOptions();
         case "PROPFIND":
-          return handlePropfind(request, env, resourcePath);
+          return handlePropfind(request, env, auth, resourcePath);
         case "GET":
         case "HEAD":
-          return handleGetLike(request, env, resourcePath);
+          return handleGetLike(request, env, auth, resourcePath);
         case "PUT":
-          return handlePut(request, env, resourcePath);
+          return handlePut(request, env, auth, resourcePath);
         case "DELETE":
-          return handleDelete(request, env, resourcePath);
+          return handleDelete(request, env, auth, resourcePath);
         case "MKCOL":
-          return handleMkcol(request, env, resourcePath);
+          return handleMkcol(request, env, auth, resourcePath);
         case "MOVE":
-          return handleMove(request, env, resourcePath);
+          return handleMove(request, env, auth, resourcePath);
         case "COPY":
-          return handleCopy(request, env, resourcePath);
+          return handleCopy(request, env, auth, resourcePath);
         case "LOCK":
-          return handleLock(request, env, resourcePath);
+          return handleLock(request, env, auth, resourcePath);
         case "UNLOCK":
-          return handleUnlock(request, env, resourcePath);
+          return handleUnlock(request, env, auth, resourcePath);
         default:
           return new Response("Method Not Allowed", {
             status: 405,
@@ -104,13 +140,18 @@ function handleOptions() {
   });
 }
 
-async function handlePropfind(request: Request, env: Env, path: string) {
+async function handlePropfind(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "read");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
   const depth = request.headers.get("Depth") ?? "1";
   if (depth !== "0" && depth !== "1") {
     return new Response("Depth not supported", { status: 400, headers: baseHeaders() });
   }
 
-  const resource = await statPath(env, path);
+  const resource = await statAuthPath(env, auth, path);
   if (!resource) {
     return new Response("Not found", { status: 404, headers: baseHeaders() });
   }
@@ -120,18 +161,23 @@ async function handlePropfind(request: Request, env: Env, path: string) {
     resources.push(...(await listChildren(env, path)));
   }
 
-  return xmlResponse(multistatusXml(resources), 207);
+  return xmlResponse(multistatusXml(resources, auth), 207);
 }
 
-async function handleGetLike(request: Request, env: Env, path: string) {
-  const resource = await statPath(env, path);
+async function handleGetLike(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "read");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
+  const resource = await statAuthPath(env, auth, path);
   if (!resource) {
     return new Response("Not found", { status: 404, headers: baseHeaders() });
   }
 
   if (resource.isCollection) {
     const children = await listChildren(env, path);
-    const body = renderDirectoryListing(path, children);
+    const body = renderDirectoryListing(path, children, auth);
     const headers = new Headers(baseHeaders());
     headers.set("Content-Type", "text/html; charset=utf-8");
     headers.set("Content-Length", String(new TextEncoder().encode(body).length));
@@ -179,8 +225,13 @@ async function handleGetLike(request: Request, env: Env, path: string) {
   return new Response(object.body, { status: range ? 206 : 200, headers });
 }
 
-async function handlePut(request: Request, env: Env, path: string) {
-  if (path === "/") {
+async function handlePut(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "write");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
+  if (isVisibleRoot(auth, path)) {
     return new Response("Cannot write root", { status: 409, headers: baseHeaders() });
   }
 
@@ -190,6 +241,7 @@ async function handlePut(request: Request, env: Env, path: string) {
     return lockCheck;
   }
 
+  await ensureAccountRoot(env, auth);
   await ensureParentsCreated(env, parentPath(path), ifHeader);
   const existing = await env.WEBDAV_BUCKET.head(toObjectKey(path));
   await env.WEBDAV_BUCKET.put(toObjectKey(path), request.body, {
@@ -204,12 +256,17 @@ async function handlePut(request: Request, env: Env, path: string) {
   });
 }
 
-async function handleDelete(request: Request, env: Env, path: string) {
-  if (path === "/") {
+async function handleDelete(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "delete");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
+  if (isVisibleRoot(auth, path)) {
     return new Response("Cannot delete root", { status: 403, headers: baseHeaders() });
   }
 
-  const target = await statPath(env, path);
+  const target = await statAuthPath(env, auth, path);
   if (!target) {
     return new Response("Not found", { status: 404, headers: baseHeaders() });
   }
@@ -228,8 +285,13 @@ async function handleDelete(request: Request, env: Env, path: string) {
   return new Response("", { status: 200, headers: baseHeaders() });
 }
 
-async function handleMkcol(request: Request, env: Env, path: string) {
-  if (path === "/") {
+async function handleMkcol(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "write");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
+  if (isVisibleRoot(auth, path)) {
     return new Response("Collection exists", { status: 405, headers: baseHeaders() });
   }
 
@@ -237,7 +299,7 @@ async function handleMkcol(request: Request, env: Env, path: string) {
     return new Response("MKCOL body not supported", { status: 415, headers: baseHeaders() });
   }
 
-  const existing = await statPath(env, path);
+  const existing = await statAuthPath(env, auth, path);
   if (existing) {
     return new Response("Already exists", { status: 405, headers: baseHeaders() });
   }
@@ -247,17 +309,30 @@ async function handleMkcol(request: Request, env: Env, path: string) {
     return lockCheck;
   }
 
-  await ensureParentExists(env, parentPath(path));
+  await ensureWritableParentExists(env, auth, parentPath(path));
   await writeDirMarker(env, path);
   return new Response("", { status: 201, headers: baseHeaders() });
 }
 
-async function handleMove(request: Request, env: Env, sourcePath: string) {
-  const destination = parseDestination(request, request.url);
-  if (!destination) {
+async function handleMove(request: Request, env: Env, auth: AuthContext, sourcePath: string) {
+  const writeCheck = requirePermission(auth, "write");
+  if (writeCheck) {
+    return writeCheck;
+  }
+  const deleteCheck = requirePermission(auth, "delete");
+  if (deleteCheck) {
+    return deleteCheck;
+  }
+
+  const destinationClientPath = parseDestination(request, request.url);
+  if (!destinationClientPath) {
     return new Response("Bad destination", { status: 400, headers: baseHeaders() });
   }
-  if (destination === "/") {
+  const destination = toStoragePath(auth, destinationClientPath);
+  if (isVisibleRoot(auth, sourcePath)) {
+    return new Response("Cannot move root", { status: 403, headers: baseHeaders() });
+  }
+  if (isVisibleRoot(auth, destination)) {
     return new Response("Bad destination", { status: 409, headers: baseHeaders() });
   }
   if (destination === sourcePath) {
@@ -265,7 +340,7 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
   }
 
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
-  const source = await statPath(env, sourcePath);
+  const source = await statAuthPath(env, auth, sourcePath);
   if (!source) {
     return new Response("Not found", { status: 404, headers: baseHeaders() });
   }
@@ -283,12 +358,12 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
     return destinationLock;
   }
 
-  const destinationExists = await statPath(env, destination);
+  const destinationExists = await statAuthPath(env, auth, destination);
   if (destinationExists && !overwrite) {
     return new Response("Destination exists", { status: 412, headers: baseHeaders() });
   }
 
-  await ensureParentExists(env, parentPath(destination));
+  await ensureWritableParentExists(env, auth, parentPath(destination));
   await withDestinationBackup(env, destination, destinationExists, async () => {
     await copyResourcePath(env, source, sourcePath, destination);
   });
@@ -300,12 +375,25 @@ async function handleMove(request: Request, env: Env, sourcePath: string) {
   });
 }
 
-async function handleCopy(request: Request, env: Env, sourcePath: string) {
-  const destination = parseDestination(request, request.url);
-  if (!destination) {
+async function handleCopy(request: Request, env: Env, auth: AuthContext, sourcePath: string) {
+  const readCheck = requirePermission(auth, "read");
+  if (readCheck) {
+    return readCheck;
+  }
+  const writeCheck = requirePermission(auth, "write");
+  if (writeCheck) {
+    return writeCheck;
+  }
+
+  const destinationClientPath = parseDestination(request, request.url);
+  if (!destinationClientPath) {
     return new Response("Bad destination", { status: 400, headers: baseHeaders() });
   }
-  if (destination === "/") {
+  const destination = toStoragePath(auth, destinationClientPath);
+  if (isVisibleRoot(auth, sourcePath)) {
+    return new Response("Cannot copy root", { status: 403, headers: baseHeaders() });
+  }
+  if (isVisibleRoot(auth, destination)) {
     return new Response("Bad destination", { status: 409, headers: baseHeaders() });
   }
   if (destination === sourcePath) {
@@ -313,7 +401,7 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
   }
 
   const overwrite = (request.headers.get("Overwrite") ?? "T").toUpperCase() !== "F";
-  const source = await statPath(env, sourcePath);
+  const source = await statAuthPath(env, auth, sourcePath);
   if (!source) {
     return new Response("Not found", { status: 404, headers: baseHeaders() });
   }
@@ -326,12 +414,12 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
     return destinationLock;
   }
 
-  const destinationExists = await statPath(env, destination);
+  const destinationExists = await statAuthPath(env, auth, destination);
   if (destinationExists && !overwrite) {
     return new Response("Destination exists", { status: 412, headers: baseHeaders() });
   }
 
-  await ensureParentExists(env, parentPath(destination));
+  await ensureWritableParentExists(env, auth, parentPath(destination));
   await withDestinationBackup(env, destination, destinationExists, async () => {
     await copyResourcePath(env, source, sourcePath, destination);
   });
@@ -342,7 +430,12 @@ async function handleCopy(request: Request, env: Env, sourcePath: string) {
   });
 }
 
-async function handleLock(request: Request, env: Env, path: string) {
+async function handleLock(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "write");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
   const timeoutSeconds = parseTimeoutSeconds(request.headers.get("Timeout"));
   const depth = request.headers.get("Depth") === "0" ? "0" : "infinity";
   const ifHeader = request.headers.get("If");
@@ -372,18 +465,23 @@ async function handleLock(request: Request, env: Env, path: string) {
     return new Response("Lock conflict", { status: result.status, headers: baseHeaders() });
   }
 
-  const target = await statPath(env, path);
+  const target = await statAuthPath(env, auth, path);
   const headers = new Headers(baseHeaders());
   headers.set("Lock-Token", `<${result.token}>`);
   headers.set("Content-Type", 'application/xml; charset="utf-8"');
 
-  return new Response(lockDiscoveryXml(path, result.token, owner, result.expiresAt, depth, target?.isCollection ?? false), {
+  return new Response(lockDiscoveryXml(path, auth, result.token, owner, result.expiresAt, depth, target?.isCollection ?? false), {
     status: target ? 200 : 201,
     headers,
   });
 }
 
-async function handleUnlock(request: Request, env: Env, path: string) {
+async function handleUnlock(request: Request, env: Env, auth: AuthContext, path: string) {
+  const permissionCheck = requirePermission(auth, "write");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+
   const token = extractLockToken(request.headers.get("Lock-Token"));
   if (!token) {
     return new Response("Missing lock token", { status: 400, headers: baseHeaders() });
@@ -467,6 +565,27 @@ async function statPath(env: Env, path: string): Promise<ResourceInfo | null> {
   return null;
 }
 
+async function statAuthPath(env: Env, auth: AuthContext, path: string): Promise<ResourceInfo | null> {
+  if (isVisibleRoot(auth, path)) {
+    const root = await statPath(env, path);
+    if (root && !root.isCollection) {
+      return root;
+    }
+    return {
+      href: "/",
+      name: "",
+      path,
+      key: null,
+      isCollection: true,
+      size: 0,
+      etag: null,
+      lastModified: root?.lastModified ?? null,
+      contentType: "httpd/unix-directory",
+    };
+  }
+  return statPath(env, path);
+}
+
 async function listChildren(env: Env, path: string): Promise<ResourceInfo[]> {
   const prefix = path === "/" ? "" : toCollectionPrefix(path);
   const items: ResourceInfo[] = [];
@@ -535,6 +654,29 @@ async function ensureParentExists(env: Env, path: string) {
   if (!parent || !parent.isCollection) {
     throw new HttpError(409, `Parent collection does not exist: ${path}`);
   }
+}
+
+async function ensureWritableParentExists(env: Env, auth: AuthContext, path: string) {
+  if (isVisibleRoot(auth, path)) {
+    await ensureAccountRoot(env, auth);
+    return;
+  }
+  await ensureParentExists(env, path);
+}
+
+async function ensureAccountRoot(env: Env, auth: AuthContext) {
+  if (auth.root === "/") {
+    return;
+  }
+  const existing = await statPath(env, auth.root);
+  if (existing?.isCollection) {
+    return;
+  }
+  if (existing) {
+    throw new HttpError(409, `Account root is not a collection: ${auth.root}`);
+  }
+  await ensureParentsCreated(env, parentPath(auth.root), null);
+  await writeDirMarker(env, auth.root);
 }
 
 async function ensureParentsCreated(env: Env, path: string, ifHeader: string | null) {
@@ -789,7 +931,7 @@ function prefixToPath(prefix: string) {
   return normalized ? `/${normalized}` : "/";
 }
 
-function multistatusXml(resources: ResourceInfo[]) {
+function multistatusXml(resources: ResourceInfo[], auth: AuthContext) {
   const responses = resources
     .map((resource) => {
       const modified = resource.lastModified ? resource.lastModified.toUTCString() : "";
@@ -797,9 +939,10 @@ function multistatusXml(resources: ResourceInfo[]) {
       const contentType = resource.contentType ?? (resource.isCollection ? "httpd/unix-directory" : "application/octet-stream");
       const resourceType = resource.isCollection ? "<D:collection/>" : "";
       const etag = resource.etag ? `<D:getetag>${escapeXml(resource.etag)}</D:getetag>` : "";
+      const href = toClientHref(auth, resource.path, resource.isCollection);
       return `
   <D:response>
-    <D:href>${escapeXml(encodePathForHref(resource.href))}</D:href>
+    <D:href>${escapeXml(href)}</D:href>
     <D:propstat>
       <D:prop>
         <D:displayname>${escapeXml(resource.name)}</D:displayname>
@@ -822,6 +965,7 @@ function multistatusXml(resources: ResourceInfo[]) {
 
 function lockDiscoveryXml(
   path: string,
+  auth: AuthContext,
   token: string,
   owner: string | null,
   expiresAt: number,
@@ -839,18 +983,22 @@ function lockDiscoveryXml(
       <D:owner>${escapeXml(owner ?? "")}</D:owner>
       <D:timeout>Second-${timeout}</D:timeout>
       <D:locktoken><D:href>${escapeXml(token)}</D:href></D:locktoken>
-      <D:lockroot><D:href>${escapeXml(encodePathForHref(ensureHref(path, isCollection)))}</D:href></D:lockroot>
+      <D:lockroot><D:href>${escapeXml(toClientHref(auth, path, isCollection))}</D:href></D:lockroot>
     </D:activelock>
   </D:lockdiscovery>
 </D:prop>`;
 }
 
-function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
-  const title = path === "/" ? "/" : path;
-  const currentDirectoryHref = encodePathForHref(ensureHref(path, true));
+function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: AuthContext) {
+  const clientPath = toClientPath(auth, path);
+  const title = clientPath === "/" ? "/" : clientPath;
+  const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
+  const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
+  const pageSubtitle = isAdminFileView ? title : "WebDAV file manager";
+  const currentDirectoryHref = toClientHref(auth, path, true);
   const rows = resources
     .map((resource) => {
-      const href = encodePathForHref(resource.href);
+      const href = toClientHref(auth, resource.path, resource.isCollection);
       const name = resource.isCollection ? `${resource.name}/` : resource.name;
       const size = resource.isCollection ? "-" : formatSize(resource.size);
       const modified = resource.lastModified ? resource.lastModified.toISOString().replace("T", " ").replace("Z", " UTC") : "-";
@@ -875,16 +1023,16 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
       </tr>`;
     })
     .join("");
-  const parentRow = path === "/"
+  const parentRow = isVisibleRoot(auth, path)
     ? ""
-    : `<tr><td></td><td class="name"><div class="name-cell"><span class="file-icon">UP</span><a class="name-text parent-link" href="${encodePathForHref(parentDirectoryHref(path))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
+    : `<tr><td></td><td class="name"><div class="name-cell"><span class="file-icon">UP</span><a class="name-text parent-link" href="${encodePathForHref(parentPath(clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
 
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Index of ${escapeHtml(title)}</title>
+  <title>${escapeHtml(pageTitle)}</title>
   <style>
     :root {
       color-scheme: light;
@@ -1164,11 +1312,12 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
 <body>
   <main>
     <header>
-      <h1>Index of ${escapeHtml(title)}</h1>
-      <p>WebDAV file manager</p>
+      <h1>${escapeHtml(pageTitle)}</h1>
+      <p>${escapeHtml(pageSubtitle)}</p>
       <div class="toolbar">
         <div class="toolbar-group">
           <button type="button" id="home-button">Home</button>
+          <button type="button" id="admin-button">Users</button>
           <label class="file-input-label" for="upload-input">Upload Files</label>
           <input id="upload-input" type="file" multiple>
           <button type="button" id="new-folder-button">New Folder</button>
@@ -1208,8 +1357,9 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
     </div>
   </div>
   <script>
-    const currentPath = ${safeJsonEmbed(path)};
+    const currentPath = ${safeJsonEmbed(clientPath)};
     const currentDirectory = ${safeJsonEmbed(currentDirectoryHref)};
+    const adminButton = document.getElementById("admin-button");
     const statusEl = document.getElementById("status");
     const homeButton = document.getElementById("home-button");
     const uploadInput = document.getElementById("upload-input");
@@ -1495,6 +1645,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[]) {
       window.location.href = "/";
     });
 
+    on(adminButton, "click", () => {
+      window.location.href = "/_admin/users";
+    });
+
     on(uploadInput, "change", async () => {
       try {
         await uploadFiles(Array.from(uploadInput.files || []));
@@ -1598,28 +1752,709 @@ function baseHeaders() {
   };
 }
 
-function isAuthorized(request: Request, env: Env) {
+function shouldShowRootAdmin(request: Request, clientPath: string) {
+  const method = request.method.toUpperCase();
+  if (clientPath !== "/" || (method !== "GET" && method !== "HEAD")) {
+    return false;
+  }
+  if (request.headers.has("Authorization")) {
+    return false;
+  }
+  const accept = request.headers.get("Accept") || "";
+  return accept.includes("text/html") || accept.includes("*/*");
+}
+
+async function authenticateRequest(request: Request, env: Env): Promise<AuthContext | null> {
+  const credentials = parseBasicAuth(request);
+  if (!credentials) {
+    return null;
+  }
+
+  const adminUser = env.ADMIN_AUTH_USER || env.BASIC_AUTH_USER;
+  const adminPass = env.ADMIN_AUTH_PASS || env.BASIC_AUTH_PASS;
+  if (adminUser && adminPass && timingSafeEquals(credentials.user, adminUser) && timingSafeEquals(credentials.pass, adminPass)) {
+    return {
+      username: credentials.user,
+      isAdmin: true,
+      root: "/",
+      mountPath: "/",
+      permissions: new Set(["read", "write", "delete"]),
+    };
+  }
+
+  const response = await userStub(env).fetch("https://users/authenticate", {
+    method: "POST",
+    body: JSON.stringify({
+      username: credentials.user,
+      password: credentials.pass,
+    }),
+  });
+  const result = (await response.json()) as {
+    ok: boolean;
+    user?: {
+      username: string;
+      root: string;
+      permissions: Permission[];
+      enabled: boolean;
+    };
+  };
+
+  if (!result.ok || !result.user?.enabled) {
+    return null;
+  }
+
+  return {
+    username: result.user.username,
+    isAdmin: false,
+    root: normalizeRootPath(result.user.root),
+    mountPath: "/",
+    permissions: new Set(result.user.permissions),
+  };
+}
+
+async function authenticateAdminRequest(request: Request, env: Env): Promise<AuthContext | null> {
+  const accessEmail = request.headers.get("Cf-Access-Authenticated-User-Email");
+  const allowedEmail = env.ACCESS_ADMIN_EMAIL;
+  if (accessEmail && allowedEmail && timingSafeEquals(accessEmail.toLowerCase(), allowedEmail.toLowerCase())) {
+    return adminAuthContext(accessEmail);
+  }
+
+  return authenticateAdminBasicRequest(request, env);
+}
+
+async function authenticateAdminBasicRequest(request: Request, env: Env): Promise<AuthContext | null> {
+  const credentials = parseBasicAuth(request);
+  if (!credentials) {
+    return null;
+  }
+
+  const adminUser = env.ADMIN_AUTH_USER || env.BASIC_AUTH_USER;
+  const adminPass = env.ADMIN_AUTH_PASS || env.BASIC_AUTH_PASS;
+  if (adminUser && adminPass && timingSafeEquals(credentials.user, adminUser) && timingSafeEquals(credentials.pass, adminPass)) {
+    return adminAuthContext(credentials.user);
+  }
+
+  return null;
+}
+
+function adminAuthContext(username: string): AuthContext {
+  return {
+    username,
+    isAdmin: true,
+    root: "/",
+    mountPath: "/",
+    permissions: new Set(["read", "write", "delete"]),
+  };
+}
+
+function parseBasicAuth(request: Request) {
   const auth = request.headers.get("Authorization");
   if (!auth?.startsWith("Basic ")) {
-    return false;
+    return null;
   }
 
   let decoded: string;
   try {
     decoded = atob(auth.slice(6));
   } catch {
-    return false;
+    return null;
   }
   const index = decoded.indexOf(":");
   if (index === -1) {
-    return false;
+    return null;
   }
 
-  const user = decoded.slice(0, index);
-  const pass = decoded.slice(index + 1);
-  const userMatches = timingSafeEquals(user, env.BASIC_AUTH_USER);
-  const passMatches = timingSafeEquals(pass, env.BASIC_AUTH_PASS);
-  return userMatches && passMatches;
+  return {
+    user: decoded.slice(0, index),
+    pass: decoded.slice(index + 1),
+  };
+}
+
+function userStub(env: Env) {
+  return env.USERS.get(env.USERS.idFromName("global-user-manager"));
+}
+
+function requirePermission(auth: AuthContext, permission: Permission) {
+  if (auth.permissions.has(permission)) {
+    return null;
+  }
+  return new Response("Forbidden", { status: 403, headers: baseHeaders() });
+}
+
+function toStoragePath(auth: AuthContext, clientPath: string) {
+  if (auth.root === "/") {
+    return clientPath;
+  }
+  if (clientPath === auth.mountPath) {
+    return auth.root;
+  }
+  const relativePath = stripPathPrefix(clientPath, auth.mountPath);
+  return joinNormalizedPath(auth.root, relativePath);
+}
+
+function toClientPath(auth: AuthContext, storagePath: string) {
+  if (auth.root === "/") {
+    return storagePath;
+  }
+  if (storagePath === auth.root) {
+    return auth.mountPath;
+  }
+  const prefix = withTrailingSlash(auth.root);
+  if (storagePath.startsWith(prefix)) {
+    return joinNormalizedPath(auth.mountPath, `/${storagePath.slice(prefix.length)}`);
+  }
+  return auth.mountPath;
+}
+
+function toClientHref(auth: AuthContext, storagePath: string, isCollection: boolean) {
+  return encodePathForHref(ensureHref(toClientPath(auth, storagePath), isCollection));
+}
+
+function isVisibleRoot(auth: AuthContext, storagePath: string) {
+  return storagePath === auth.root;
+}
+
+function resolveMountPath(auth: AuthContext, clientPath: string) {
+  if (auth.root === "/") {
+    return "/";
+  }
+  if (clientPath === auth.root || clientPath.startsWith(withTrailingSlash(auth.root))) {
+    return auth.root;
+  }
+  return "/";
+}
+
+function stripPathPrefix(path: string, prefix: string) {
+  if (prefix === "/") {
+    return path;
+  }
+  if (path === prefix) {
+    return "/";
+  }
+  const withSlash = withTrailingSlash(prefix);
+  if (path.startsWith(withSlash)) {
+    return `/${path.slice(withSlash.length)}`;
+  }
+  return path;
+}
+
+function joinNormalizedPath(base: string, child: string) {
+  if (base === "/") {
+    return child;
+  }
+  if (child === "/") {
+    return base;
+  }
+  return `${base}${child}`;
+}
+
+function normalizeRootPath(value: string) {
+  const parts = value.split("/").filter(Boolean);
+  for (const part of parts) {
+    if (part === "." || part === "..") {
+      throw new HttpError(400, "Invalid root");
+    }
+  }
+  return parts.length === 0 ? "/" : `/${parts.join("/")}`;
+}
+
+async function handleAdminRequest(request: Request, env: Env, auth: AuthContext, path: string) {
+  if (!auth.isAdmin) {
+    return new Response("Forbidden", { status: 403, headers: baseHeaders() });
+  }
+
+  const method = request.method.toUpperCase();
+  if (method === "GET" && (path === ADMIN_PREFIX || path === `${ADMIN_PREFIX}/users`)) {
+    const body = renderAdminUsersPage();
+    return new Response(body, {
+      status: 200,
+      headers: {
+        ...baseHeaders(),
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users` && method === "GET") {
+    return proxyUserManager(env, "/users", "GET");
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users/create` && method === "POST") {
+    return proxyUserManager(env, "/users/create", "POST", await request.text());
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users/update` && method === "POST") {
+    return proxyUserManager(env, "/users/update", "POST", await request.text());
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users/reset-password` && method === "POST") {
+    return proxyUserManager(env, "/users/reset-password", "POST", await request.text());
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users/reveal-password` && method === "POST") {
+    return proxyUserManager(env, "/users/reveal-password", "POST", await request.text());
+  }
+
+  if (path === `${ADMIN_PREFIX}/api/users/delete` && method === "POST") {
+    return proxyUserManager(env, "/users/delete", "POST", await request.text());
+  }
+
+  if (path === `${ADMIN_PREFIX}/files` || path.startsWith(`${ADMIN_PREFIX}/files/`)) {
+    return handleAdminFilesRequest(request, env, path);
+  }
+
+  return new Response("Not found", { status: 404, headers: baseHeaders() });
+}
+
+async function handleAdminFilesRequest(request: Request, env: Env, path: string) {
+  const relative = stripPathPrefix(path, `${ADMIN_PREFIX}/files`);
+  const parts = relative.split("/").filter(Boolean);
+  const username = parts.shift();
+  if (!username) {
+    return Response.redirect(new URL(`${ADMIN_PREFIX}/users`, request.url), 302);
+  }
+
+  const user = await getManagedUser(env, username);
+  if (!user?.enabled) {
+    return new Response("User not found", { status: 404, headers: baseHeaders() });
+  }
+
+  const clientPath = parts.length === 0 ? "/" : `/${parts.join("/")}`;
+  const auth = managedUserFileAuth(user, `${ADMIN_PREFIX}/files/${encodeURIComponent(user.username)}`);
+  const resourcePath = toStoragePath(auth, clientPath);
+
+  switch (request.method.toUpperCase()) {
+    case "OPTIONS":
+      return handleOptions();
+    case "PROPFIND":
+      return handlePropfind(request, env, auth, resourcePath);
+    case "GET":
+    case "HEAD":
+      return handleGetLike(request, env, auth, resourcePath);
+    case "PUT":
+      return handlePut(request, env, auth, resourcePath);
+    case "DELETE":
+      return handleDelete(request, env, auth, resourcePath);
+    case "MKCOL":
+      return handleMkcol(request, env, auth, resourcePath);
+    case "MOVE":
+      return handleMove(request, env, auth, resourcePath);
+    case "COPY":
+      return handleCopy(request, env, auth, resourcePath);
+    case "LOCK":
+      return handleLock(request, env, auth, resourcePath);
+    case "UNLOCK":
+      return handleUnlock(request, env, auth, resourcePath);
+    default:
+      return new Response("Method Not Allowed", { status: 405, headers: baseHeaders() });
+  }
+}
+
+async function getManagedUser(env: Env, username: string) {
+  const response = await userStub(env).fetch("https://users/users");
+  const result = (await response.json()) as {
+    ok: boolean;
+    users?: Array<{
+      username: string;
+      root: string;
+      permissions: Permission[];
+      enabled: boolean;
+    }>;
+  };
+  return result.users?.find((user) => user.username === username) ?? null;
+}
+
+function managedUserFileAuth(
+  user: { username: string; root: string; permissions: Permission[] },
+  mountPath: string,
+): AuthContext {
+  return {
+    username: user.username,
+    isAdmin: false,
+    root: normalizeRootPath(user.root),
+    mountPath,
+    permissions: new Set(user.permissions),
+  };
+}
+
+async function proxyUserManager(env: Env, path: string, method: string, body?: string) {
+  const response = await userStub(env).fetch(`https://users${path}`, { method, body });
+  return new Response(response.body, {
+    status: response.status,
+    headers: {
+      ...baseHeaders(),
+      "Content-Type": response.headers.get("Content-Type") || "application/json",
+    },
+  });
+}
+
+function renderAdminUsersPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDAV Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7fb;
+      --panel: #ffffff;
+      --line: #d7ddea;
+      --line-soft: #e8edf5;
+      --text: #152033;
+      --muted: #5a6b84;
+      --link: #0a5bd8;
+      --accent: #0f766e;
+      --accent-soft: #d8f3f0;
+      --danger: #b42318;
+      --danger-soft: #fde6e4;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 12px;
+      background: linear-gradient(180deg, #eef3ff 0%, #f7f9fd 100%);
+      color: var(--text);
+      font: 13px/1.35 "Segoe UI", system-ui, sans-serif;
+    }
+    main {
+      max-width: 1380px;
+      margin: 0 auto 0 0;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 10px 28px rgba(10, 25, 55, 0.06);
+    }
+    header {
+      padding: 12px 16px 10px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #fbfdff 0%, #f5f8fd 100%);
+    }
+    .header-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    h1 {
+      margin: 0 0 2px;
+      font-size: 18px;
+      line-height: 1.15;
+      font-weight: 600;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button, input, select {
+      font: inherit;
+    }
+    button {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 2px 7px;
+      cursor: pointer;
+      font-size: 11px;
+      line-height: 1.2;
+    }
+    input, select {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 6px 8px;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: var(--danger); border-color: #efb4ae; background: #fff; }
+    .status {
+      min-height: 34px;
+      padding: 7px 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      font-size: 12px;
+    }
+    .status[data-tone="success"] { background: var(--accent-soft); color: #0b5f59; }
+    .status[data-tone="error"] { background: var(--danger-soft); color: var(--danger); }
+    .form {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: grid;
+      grid-template-columns: minmax(140px, 1fr) minmax(220px, 2fr) minmax(140px, 1fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+    .field { display: grid; gap: 4px; }
+    label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+    .checks { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; min-height: 32px; }
+    .checks label { text-transform: none; font-size: 12px; color: var(--text); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--line-soft);
+      text-align: left;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    th {
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    tbody tr:hover { background: #f8fbff; }
+    tbody tr:nth-child(even) { background: #fcfdff; }
+    td.actions { display: flex; gap: 4px; flex-wrap: nowrap; align-items: center; }
+    .mono { font-family: Consolas, "SFMono-Regular", monospace; font-size: 12px; }
+    .password-box {
+      margin: 14px 16px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      display: none;
+      gap: 8px;
+    }
+    .password-box.is-visible { display: grid; }
+    .password-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    code {
+      background: #eef2f7;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 5px 7px;
+      word-break: break-all;
+    }
+    @media (max-width: 760px) {
+      .form { grid-template-columns: 1fr; }
+      body { padding: 6px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="header-row">
+        <div>
+          <h1>WebDAV Admin</h1>
+          <p>Users and managed files</p>
+        </div>
+        <div class="toolbar">
+          <button type="button" id="files-button">My Files</button>
+          <button type="button" id="refresh-button">Refresh</button>
+        </div>
+      </div>
+    </header>
+    <div id="status" class="status">Loading users...</div>
+    <section class="form">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" autocomplete="off" placeholder="joplin">
+      </div>
+      <div class="field">
+        <label>Permissions</label>
+        <div class="checks">
+          <label><input type="checkbox" id="perm-read" checked> Read</label>
+          <label><input type="checkbox" id="perm-write" checked> Write</label>
+          <label><input type="checkbox" id="perm-delete" checked> Delete</label>
+        </div>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" autocomplete="new-password" placeholder="auto-generate">
+      </div>
+      <button type="button" id="create-button" class="primary">Create User</button>
+    </section>
+    <section id="password-box" class="password-box">
+      <strong>Password</strong>
+      <div class="password-row">
+        <code id="generated-password"></code>
+        <button type="button" id="copy-password-button">Copy</button>
+      </div>
+    </section>
+    <section style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>User</th><th>Directory</th><th>Permissions</th><th>Enabled</th><th>Last Used</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="users-body"></tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.getElementById("status");
+    const usersBody = document.getElementById("users-body");
+    const passwordBox = document.getElementById("password-box");
+    const generatedPassword = document.getElementById("generated-password");
+
+    function setStatus(message, tone = "") {
+      statusEl.textContent = message;
+      statusEl.dataset.tone = tone;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch("/_admin/api" + path, {
+        method: options.method || "GET",
+        headers: { "Content-Type": "application/json" },
+        body: options.body ? JSON.stringify(options.body) : undefined,
+      });
+      const result = await response.json();
+      if (!result.ok) {
+        throw new Error(result.message || "Request failed");
+      }
+      return result;
+    }
+
+    function permissionsFromForm() {
+      return [
+        document.getElementById("perm-read").checked ? "read" : "",
+        document.getElementById("perm-write").checked ? "write" : "",
+        document.getElementById("perm-delete").checked ? "delete" : "",
+      ].filter(Boolean);
+    }
+
+    function fmtTime(value) {
+      return value ? new Date(value).toLocaleString() : "-";
+    }
+
+    function showPassword(password) {
+      generatedPassword.textContent = password;
+      passwordBox.classList.add("is-visible");
+    }
+
+    async function copyText(value, label) {
+      await navigator.clipboard.writeText(value);
+      setStatus(label + " copied.", "success");
+    }
+
+    async function loadUsers() {
+      setStatus("Loading users...");
+      const result = await api("/users");
+      usersBody.innerHTML = result.users.map((user) => {
+        return '<tr data-user="' + escapeHtml(user.username) + '">' +
+          '<td class="mono">' + escapeHtml(user.username) + '</td>' +
+          '<td class="mono">' + escapeHtml(user.root) + '</td>' +
+          '<td><input data-field="permissions" value="' + escapeHtml(user.permissions.join(",")) + '"></td>' +
+          '<td><select data-field="enabled"><option value="true"' + (user.enabled ? " selected" : "") + '>yes</option><option value="false"' + (!user.enabled ? " selected" : "") + '>no</option></select></td>' +
+          '<td class="mono">' + escapeHtml(fmtTime(user.lastUsedAt)) + '</td>' +
+          '<td class="actions"><button data-action="files">Files</button><button data-action="copy-user">Copy User</button><button data-action="copy-password">Copy Password</button><button data-action="save">Save</button><button data-action="reset">Reset Password</button><button data-action="delete" class="danger">Delete</button></td>' +
+        '</tr>';
+      }).join("");
+      setStatus("Users loaded.", "success");
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+
+    document.getElementById("files-button").addEventListener("click", () => {
+      const firstUser = usersBody.querySelector("tr[data-user]")?.dataset.user;
+      window.location.href = firstUser ? "/_admin/files/" + encodeURIComponent(firstUser) + "/" : "/";
+    });
+    document.getElementById("refresh-button").addEventListener("click", () => {
+      loadUsers().catch((error) => setStatus(error.message, "error"));
+    });
+    document.getElementById("copy-password-button").addEventListener("click", async () => {
+      await copyText(generatedPassword.textContent || "", "Password");
+    });
+    document.getElementById("create-button").addEventListener("click", async () => {
+      try {
+        const username = document.getElementById("username").value;
+        const password = document.getElementById("password").value;
+        const result = await api("/users/create", {
+          method: "POST",
+          body: {
+            username,
+            permissions: permissionsFromForm(),
+            password: password || undefined,
+          },
+        });
+        showPassword(result.password);
+        document.getElementById("username").value = "";
+        document.getElementById("password").value = "";
+        setStatus("User created.", "success");
+        await loadUsers();
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Create failed.", "error");
+      }
+    });
+
+    usersBody.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) {
+        return;
+      }
+      const row = button.closest("tr");
+      const username = row.dataset.user;
+      try {
+        if (button.dataset.action === "save") {
+          await api("/users/update", {
+            method: "POST",
+            body: {
+              username,
+              permissions: row.querySelector('[data-field="permissions"]').value.split(",").map((v) => v.trim()).filter(Boolean),
+              enabled: row.querySelector('[data-field="enabled"]').value === "true",
+            },
+          });
+          setStatus("User saved.", "success");
+          await loadUsers();
+        }
+        if (button.dataset.action === "files") {
+          window.location.href = "/_admin/files/" + encodeURIComponent(username) + "/";
+          return;
+        }
+        if (button.dataset.action === "copy-user") {
+          await copyText(username, "Username");
+          return;
+        }
+        if (button.dataset.action === "copy-password") {
+          const result = await api("/users/reveal-password", { method: "POST", body: { username } });
+          showPassword(result.password);
+          await copyText(result.password, "Password");
+          return;
+        }
+        if (button.dataset.action === "reset") {
+          if (!window.confirm("Reset password for " + username + "?")) {
+            return;
+          }
+          const result = await api("/users/reset-password", { method: "POST", body: { username } });
+          showPassword(result.password);
+          setStatus("Password reset.", "success");
+        }
+        if (button.dataset.action === "delete") {
+          if (!window.confirm("Delete user " + username + "?")) {
+            return;
+          }
+          await api("/users/delete", { method: "POST", body: { username } });
+          setStatus("User deleted.", "success");
+          await loadUsers();
+        }
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Action failed.", "error");
+      }
+    });
+
+    loadUsers().catch((error) => setStatus(error.message, "error"));
+  </script>
+</body>
+</html>`;
 }
 
 function escapeXml(value: string) {

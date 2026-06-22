@@ -3,14 +3,13 @@
 	"name": "cloudflare-webdav-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-04-05",
-	"workers_dev": true,
-	// For production, either keep workers.dev enabled or replace this with your own custom domain.
-	// "routes": [
-	// 	{
-	// 		"pattern": "webdav.example.com",
-	// 		"custom_domain": true
-	// 	}
-	// ],
+	"workers_dev": false,
+	"routes": [
+		{
+			"pattern": "webdav.669999.xyz",
+			"custom_domain": true
+		}
+	],
 	"r2_buckets": [
 		{
 			"binding": "WEBDAV_BUCKET",
@@ -22,6 +21,10 @@
 			{
 				"name": "LOCKS",
 				"class_name": "WebDavLockManager"
+			},
+			{
+				"name": "USERS",
+				"class_name": "WebDavUserManager"
 			}
 		]
 	},
@@ -30,6 +33,12 @@
 			"tag": "v1",
 			"new_sqlite_classes": [
 				"WebDavLockManager"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"WebDavUserManager"
 			]
 		}
 	],

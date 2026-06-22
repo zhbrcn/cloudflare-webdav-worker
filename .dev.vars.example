@@ -1,2 +1,6 @@
 BASIC_AUTH_USER=webdav
 BASIC_AUTH_PASS=replace-with-a-long-random-password
+ADMIN_AUTH_USER=admin
+ADMIN_AUTH_PASS=replace-with-an-admin-password
+ACCESS_ADMIN_EMAIL=admin@example.com
+PASSWORD_SECRET=replace-with-a-long-random-encryption-secret
