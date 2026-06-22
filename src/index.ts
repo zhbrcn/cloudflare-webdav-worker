@@ -1445,13 +1445,17 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   <style>
     ${renderSharedStyles()}
     .file-app {
-      max-width: none;
+      max-width: 1380px;
       width: 100%;
+      min-height: calc(100vh - 24px);
       overflow: visible;
+      display: flex;
+      flex-direction: column;
     }
     .file-app header {
       border-top-left-radius: 8px;
       border-top-right-radius: 8px;
+      flex: 0 0 auto;
     }
     th {
       position: sticky;
@@ -1511,12 +1515,14 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     .table-wrap {
       overflow-x: auto;
       overflow-y: visible;
+      flex: 1 1 auto;
     }
     .file-list-header {
       border-top: 1px solid var(--line);
       border-bottom: 1px solid var(--line);
       padding: 10px 12px;
       background: var(--panel);
+      flex: 0 0 auto;
     }
     .modal[hidden] {
       display: none;
@@ -1676,6 +1682,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
     }
     @media (max-width: 640px) {
+      .file-app { min-height: 100vh; }
       .table-wrap { max-height: none; overflow-x: visible; }
       .file-app header { border-radius: 0; }
       .file-toolbar-label { flex: 1 1 100%; }
@@ -1690,8 +1697,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       <div class="page-heading">
         <div class="header-row">
           <div>
-            <h1>${escapeHtml(pageTitle)}</h1>
-            <p>${escapeHtml(pageSubtitle)}</p>
+            <h1>${escapeHtml(pageTitle)}${pageSubtitle ? ` <span class="muted">${escapeHtml(pageSubtitle)}</span>` : ""}</h1>
           </div>
         </div>
         <div class="toolbar">
@@ -1709,8 +1715,8 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
           <button type="button" id="delete-selected-button" class="danger">Delete Selected</button>
           </div>
           <div class="toolbar-group">
-          <input id="search-input" class="search-input" type="search" placeholder="Search files">
           <button type="button" id="refresh-button">Refresh</button>
+          <input id="search-input" class="search-input" type="search" placeholder="Search files">
           </div>
         </div>
       </div>
