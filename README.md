@@ -132,11 +132,13 @@ The admin page can:
 - create WebDAV users
 - auto-generate long random passwords
 - copy usernames and stored passwords
+- reveal stored passwords only after an explicit show action
 - reset passwords
 - enable or disable users
 - delete users
 - assign read/write/delete permissions with checkboxes
 - browse and manage each user's files through the same browser file manager
+- review recent sensitive account actions in the audit log
 
 Managed user passwords are hashed for authentication and also stored as AES-GCM ciphertext so the Zero Trust-protected admin UI can copy them later. If `PASSWORD_SECRET` and the Durable Object data are both exposed, stored passwords can be recovered.
 
@@ -211,9 +213,12 @@ npm.cmd run deploy
 ## Project Files
 
 - [src/index.ts](./src/index.ts): Worker entrypoint, WebDAV handlers, browser UI
+- [src/http.ts](./src/http.ts): shared HTTP response headers and XML responses
+- [src/utils.ts](./src/utils.ts): shared escaping, path, formatting, and comparison helpers
 - [src/lock-do.ts](./src/lock-do.ts): Durable Object lock manager
 - [src/user-do.ts](./src/user-do.ts): Durable Object user manager
 - [wrangler.jsonc](./wrangler.jsonc): Wrangler configuration
+- [scripts/smoke.sh](./scripts/smoke.sh): production smoke checks
 
 ## Publish Checklist
 
@@ -229,4 +234,6 @@ npm.cmd run deploy
 - set final `ACCESS_AUD`
 - set final `PASSWORD_SECRET`
 - run `npm.cmd run check`
+- run `npm run dry-run`
+- run `npm run smoke`
 - run `npm.cmd run deploy`

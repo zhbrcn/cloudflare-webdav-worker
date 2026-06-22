@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "dry-run": "wrangler deploy --dry-run",
+    "smoke": "scripts/smoke.sh"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260401.0",

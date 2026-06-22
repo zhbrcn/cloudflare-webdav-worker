@@ -1,5 +1,19 @@
 import { WebDavLockManager } from "./lock-do";
 import { WebDavUserManager } from "./user-do";
+import { baseHeaders, htmlHeaders, xmlResponse } from "./http";
+import {
+  basename,
+  base64UrlDecode,
+  encodePathForHref,
+  ensureHref,
+  escapeHtml,
+  escapeXml,
+  formatSize,
+  parentPath,
+  safeJsonEmbed,
+  timingSafeEquals,
+  withTrailingSlash,
+} from "./utils";
 
 const DIR_MARKER = "._cf_webdav_dir";
 const XML_NS = "DAV:";
@@ -920,27 +934,6 @@ function dirMarkerKey(path: string) {
   return `${prefix}${DIR_MARKER}`;
 }
 
-function parentPath(path: string) {
-  if (path === "/") {
-    return "/";
-  }
-  const parts = path.split("/").filter(Boolean);
-  parts.pop();
-  return parts.length === 0 ? "/" : `/${parts.join("/")}`;
-}
-
-function basename(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? "";
-}
-
-function ensureHref(path: string, isCollection: boolean) {
-  if (path === "/") {
-    return "/";
-  }
-  return isCollection ? `${path}/` : path;
-}
-
 function prefixToPath(prefix: string) {
   const normalized = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
   return normalized ? `/${normalized}` : "/";
@@ -1173,6 +1166,41 @@ function renderSharedStyles() {
       padding-left: 10px;
       border-left: 1px solid var(--line);
     }
+    .action-menu {
+      position: relative;
+    }
+    .action-menu summary {
+      list-style: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 8px;
+      cursor: pointer;
+      background: var(--panel);
+      font-size: 12px;
+      min-height: 26px;
+    }
+    .action-menu summary::-webkit-details-marker {
+      display: none;
+    }
+    .action-menu-panel {
+      position: absolute;
+      right: 0;
+      top: calc(100% + 4px);
+      z-index: 5;
+      min-width: 128px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      display: grid;
+      gap: 4px;
+    }
+    .action-menu-panel button {
+      width: 100%;
+      text-align: left;
+      justify-content: flex-start;
+    }
     .status {
       padding: 8px 12px;
       border-bottom: 1px solid var(--line);
@@ -1190,6 +1218,19 @@ function renderSharedStyles() {
     .status[data-tone="error"] {
       background: var(--danger-soft);
       color: var(--danger);
+    }
+    .status[data-loading="true"]::before {
+      content: "";
+      width: 12px;
+      height: 12px;
+      margin-right: 8px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 999px;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
     table {
       width: 100%;
@@ -1399,41 +1440,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       gap: 4px;
       white-space: nowrap;
       align-items: center;
-    }
-    .action-menu {
-      position: relative;
-    }
-    .action-menu summary {
-      list-style: none;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 4px 8px;
-      cursor: pointer;
-      background: var(--panel);
-      font-size: 12px;
-      min-height: 26px;
-    }
-    .action-menu summary::-webkit-details-marker {
-      display: none;
-    }
-    .action-menu-panel {
-      position: absolute;
-      right: 0;
-      top: calc(100% + 4px);
-      z-index: 5;
-      min-width: 128px;
-      padding: 6px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel);
-      box-shadow: var(--shadow);
-      display: grid;
-      gap: 4px;
-    }
-    .action-menu-panel button {
-      width: 100%;
-      text-align: left;
-      justify-content: flex-start;
     }
     .drop-target {
       outline: 2px solid var(--accent);
@@ -1667,6 +1673,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
       statusEl.textContent = message;
       statusEl.dataset.tone = tone;
+      statusEl.dataset.loading = /ing\\b|Loading|Uploading|Moving|Deleting|Saving|Creating/.test(message) ? "true" : "false";
     }
 
     function joinPath(baseHref, name) {
@@ -2041,43 +2048,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   </script>
 </body>
 </html>`;
-}
-
-function xmlResponse(body: string, status: number) {
-  return new Response(body, {
-    status,
-    headers: {
-      ...baseHeaders(),
-      "Content-Type": 'application/xml; charset="utf-8"',
-    },
-  });
-}
-
-function baseHeaders() {
-  return {
-    DAV: "1, 2",
-    "MS-Author-Via": "DAV",
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "same-origin",
-  };
-}
-
-function htmlHeaders() {
-  return {
-    ...baseHeaders(),
-    "Content-Type": "text/html; charset=utf-8",
-    "Content-Security-Policy": [
-      "default-src 'none'",
-      "base-uri 'none'",
-      "form-action 'self'",
-      "frame-ancestors 'none'",
-      "img-src 'self' data:",
-      "style-src 'unsafe-inline'",
-      "script-src 'unsafe-inline'",
-      "connect-src 'self'",
-    ].join("; "),
-  };
 }
 
 function validateSameOrigin(request: Request) {
@@ -2485,6 +2455,10 @@ async function handleAdminRequest(request: Request, env: Env, auth: AuthContext,
     return proxyUserManager(env, "/users", "GET");
   }
 
+  if (path === `${ADMIN_PREFIX}/api/audit` && method === "GET") {
+    return proxyUserManager(env, "/audit", "GET");
+  }
+
   if (path === `${ADMIN_PREFIX}/api/users/create` && method === "POST") {
     const body = await request.text();
     await recordAdminAudit(env, auth.username, "user.create", auditTargetFromBody(body));
@@ -2641,6 +2615,10 @@ function renderAdminUsersPage() {
     label { color: var(--muted); font-size: 11px; text-transform: uppercase; }
     td.actions { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
     td.permission-cell { min-width: 210px; white-space: normal; }
+    .admin-grid {
+      display: grid;
+      gap: 0;
+    }
     .password-box {
       margin: 14px 16px;
       padding: 10px;
@@ -2652,6 +2630,23 @@ function renderAdminUsersPage() {
     }
     .password-box.is-visible { display: grid; }
     .password-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .audit-section {
+      border-top: 1px solid var(--line);
+      padding: 14px 16px 16px;
+      display: grid;
+      gap: 10px;
+    }
+    .audit-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .audit-header h2 {
+      margin: 0;
+      font-size: 15px;
+    }
     code {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -2708,29 +2703,54 @@ function renderAdminUsersPage() {
       <strong>Password</strong>
       <div class="password-row">
         <code id="generated-password"></code>
+        <button type="button" id="toggle-password-button">Show</button>
         <button type="button" id="copy-password-button">Copy</button>
       </div>
     </section>
-    <section style="overflow-x:auto">
-      <table>
-        <thead>
-          <tr>
-            <th>User</th><th>Directory</th><th>Permissions</th><th>Enabled</th><th>Last Used</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="users-body"></tbody>
-      </table>
-    </section>
+    <div class="admin-grid">
+      <section style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>User</th><th>Directory</th><th>Permissions</th><th>Enabled</th><th>Last Used</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="users-body"></tbody>
+        </table>
+      </section>
+      <section class="audit-section">
+        <div class="audit-header">
+          <div>
+            <h2>Audit Log</h2>
+            <p>Recent sensitive account actions.</p>
+          </div>
+          <button type="button" id="refresh-audit-button">Refresh Audit</button>
+        </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th></tr>
+            </thead>
+            <tbody id="audit-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
   </main>
   <script>
     const statusEl = document.getElementById("status");
     const usersBody = document.getElementById("users-body");
+    const auditBody = document.getElementById("audit-body");
     const passwordBox = document.getElementById("password-box");
     const generatedPassword = document.getElementById("generated-password");
+    const togglePasswordButton = document.getElementById("toggle-password-button");
+    let currentPassword = "";
+    let passwordVisible = false;
 
     function setStatus(message, tone = "") {
       statusEl.textContent = message;
       statusEl.dataset.tone = tone;
+      statusEl.dataset.loading = /ing\\b|Loading|Saving|Creating|Resetting|Deleting/.test(message) ? "true" : "false";
     }
 
     async function api(path, options = {}) {
@@ -2759,8 +2779,17 @@ function renderAdminUsersPage() {
     }
 
     function showPassword(password) {
-      generatedPassword.textContent = password;
+      currentPassword = password || "";
+      passwordVisible = false;
+      generatedPassword.textContent = "*".repeat(Math.min(Math.max(currentPassword.length, 12), 48));
+      togglePasswordButton.textContent = "Show";
       passwordBox.classList.add("is-visible");
+    }
+
+    function togglePasswordVisibility() {
+      passwordVisible = !passwordVisible;
+      generatedPassword.textContent = passwordVisible ? currentPassword : "*".repeat(Math.min(Math.max(currentPassword.length, 12), 48));
+      togglePasswordButton.textContent = passwordVisible ? "Hide" : "Show";
     }
 
     function permissionChecks(user) {
@@ -2793,10 +2822,31 @@ function renderAdminUsersPage() {
           '<td class="permission-cell">' + permissionChecks(user) + '</td>' +
           '<td><select data-field="enabled"><option value="true"' + (user.enabled ? " selected" : "") + '>yes</option><option value="false"' + (!user.enabled ? " selected" : "") + '>no</option></select></td>' +
           '<td class="mono">' + escapeHtml(fmtTime(user.lastUsedAt)) + '</td>' +
-          '<td class="actions"><button data-action="files">Files</button><button data-action="copy-user">Copy User</button><button data-action="copy-password">Copy Password</button><button data-action="save">Save</button><button data-action="reset">Reset Password</button><button data-action="delete" class="danger">Delete</button></td>' +
+          '<td class="actions">' +
+            '<button data-action="save" class="primary">Save</button>' +
+            '<details class="action-menu"><summary>Actions</summary><div class="action-menu-panel">' +
+              '<button data-action="files">Files</button>' +
+              '<button data-action="copy-user">Copy User</button>' +
+              '<button data-action="copy-password">Copy Password</button>' +
+              '<button data-action="reset">Reset Password</button>' +
+              '<button data-action="delete" class="danger">Delete</button>' +
+            '</div></details>' +
+          '</td>' +
         '</tr>';
       }).join("");
       setStatus("Users loaded.", "success");
+    }
+
+    async function loadAudit() {
+      const result = await api("/audit");
+      auditBody.innerHTML = result.events.length ? result.events.map((event) => {
+        return '<tr>' +
+          '<td class="mono">' + escapeHtml(fmtTime(event.ts)) + '</td>' +
+          '<td class="mono">' + escapeHtml(event.actor) + '</td>' +
+          '<td>' + escapeHtml(event.action) + '</td>' +
+          '<td class="mono">' + escapeHtml(event.target || "-") + '</td>' +
+        '</tr>';
+      }).join("") : '<tr><td colspan="4"><div class="empty-state">No audit events yet.</div></td></tr>';
     }
 
     function escapeHtml(value) {
@@ -2808,10 +2858,16 @@ function renderAdminUsersPage() {
       window.location.href = firstUser ? "/_admin/files/" + encodeURIComponent(firstUser) + "/" : "/";
     });
     document.getElementById("refresh-button").addEventListener("click", () => {
-      loadUsers().catch((error) => setStatus(error.message, "error"));
+      Promise.all([loadUsers(), loadAudit()]).catch((error) => setStatus(error.message, "error"));
+    });
+    document.getElementById("refresh-audit-button").addEventListener("click", () => {
+      loadAudit().catch((error) => setStatus(error.message, "error"));
     });
     document.getElementById("copy-password-button").addEventListener("click", async () => {
-      await copyText(generatedPassword.textContent || "", "Password");
+      await copyText(currentPassword, "Password");
+    });
+    togglePasswordButton.addEventListener("click", () => {
+      togglePasswordVisibility();
     });
     document.getElementById("create-button").addEventListener("click", async () => {
       try {
@@ -2830,6 +2886,7 @@ function renderAdminUsersPage() {
         document.getElementById("password").value = "";
         setStatus("User created.", "success");
         await loadUsers();
+        await loadAudit();
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Create failed.", "error");
       }
@@ -2843,6 +2900,7 @@ function renderAdminUsersPage() {
       const row = button.closest("tr");
       const username = row.dataset.user;
       try {
+        button.closest("details")?.removeAttribute("open");
         if (button.dataset.action === "save") {
           await api("/users/update", {
             method: "POST",
@@ -2854,6 +2912,7 @@ function renderAdminUsersPage() {
           });
           setStatus("User saved.", "success");
           await loadUsers();
+          await loadAudit();
         }
         if (button.dataset.action === "files") {
           window.location.href = "/_admin/files/" + encodeURIComponent(username) + "/";
@@ -2867,6 +2926,7 @@ function renderAdminUsersPage() {
           const result = await api("/users/reveal-password", { method: "POST", body: { username } });
           showPassword(result.password);
           await copyText(result.password, "Password");
+          await loadAudit();
           return;
         }
         if (button.dataset.action === "reset") {
@@ -2876,6 +2936,7 @@ function renderAdminUsersPage() {
           const result = await api("/users/reset-password", { method: "POST", body: { username } });
           showPassword(result.password);
           setStatus("Password reset.", "success");
+          await loadAudit();
         }
         if (button.dataset.action === "delete") {
           if (!window.confirm("Delete user " + username + "?")) {
@@ -2884,64 +2945,17 @@ function renderAdminUsersPage() {
           await api("/users/delete", { method: "POST", body: { username } });
           setStatus("User deleted.", "success");
           await loadUsers();
+          await loadAudit();
         }
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Action failed.", "error");
       }
     });
 
-    loadUsers().catch((error) => setStatus(error.message, "error"));
+    Promise.all([loadUsers(), loadAudit()]).catch((error) => setStatus(error.message, "error"));
   </script>
 </body>
 </html>`;
-}
-
-function escapeXml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-function escapeHtml(value: string) {
-  return escapeXml(value);
-}
-
-function safeJsonEmbed(value: string) {
-  return JSON.stringify(value).replace(/</g, "\\u003c");
-}
-
-function base64UrlDecode(value: string) {
-  const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function timingSafeEquals(left: string, right: string) {
-  const encoder = new TextEncoder();
-  const a = encoder.encode(left);
-  const b = encoder.encode(right);
-  let mismatch = a.length !== b.length ? 1 : 0;
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    mismatch |= (a[i] ?? 0) ^ (b[i] ?? 0);
-  }
-  return mismatch === 0;
-}
-
-function encodePathForHref(path: string) {
-  if (path === "/") {
-    return "/";
-  }
-  return path
-    .split("/")
-    .map((part, index) => (index === 0 ? "" : encodeURIComponent(part)))
-    .join("/");
 }
 
 function parentDirectoryHref(path: string) {
@@ -2949,26 +2963,8 @@ function parentDirectoryHref(path: string) {
   return ensureHref(parent, true);
 }
 
-function formatSize(size: number) {
-  if (size < 1024) {
-    return `${size} B`;
-  }
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = size;
-  let unitIndex = -1;
-  do {
-    value /= 1024;
-    unitIndex += 1;
-  } while (value >= 1024 && unitIndex < units.length - 1);
-  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
-}
-
 function isSameOrDescendantPath(sourcePath: string, destinationPath: string) {
   return destinationPath === sourcePath || destinationPath.startsWith(withTrailingSlash(sourcePath));
-}
-
-function withTrailingSlash(path: string) {
-  return path.endsWith("/") ? path : `${path}/`;
 }
 
 function parseRangeHeader(rangeHeader: string | null, size: number): R2Range | null | { error: true } {

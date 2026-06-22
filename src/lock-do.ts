@@ -139,9 +139,7 @@ export class WebDavLockManager {
   }
 
   private findConflict(path: string, depth: "0" | "infinity"): LockRecord | null {
-    for (const row of this.ctx.storage.sql.exec<LockRecord>(
-      "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks",
-    )) {
+    for (const row of this.queryCandidateLocks(path, depth === "infinity")) {
       if (locksConflict(row.path, row.depth, path, depth)) {
         return row;
       }
@@ -151,14 +149,42 @@ export class WebDavLockManager {
 
   private getConflicts(path: string, recursive: boolean): LockRecord[] {
     const conflicts: LockRecord[] = [];
-    for (const row of this.ctx.storage.sql.exec<LockRecord>(
-      "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks",
-    )) {
+    for (const row of this.queryCandidateLocks(path, recursive)) {
       if (overlaps(row.path, row.depth, path) || (recursive && overlaps(path, "infinity", row.path))) {
         conflicts.push(row);
       }
     }
     return conflicts;
+  }
+
+  private queryCandidateLocks(path: string, includeDescendants: boolean): LockRecord[] {
+    const candidates = new Map<string, LockRecord>();
+    const addRows = (rows: Iterable<LockRecord>) => {
+      for (const row of rows) {
+        candidates.set(row.path, row);
+      }
+    };
+
+    addRows(this.ctx.storage.sql.exec<LockRecord>(
+      "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks WHERE path = ?1",
+      path,
+    ));
+
+    for (const ancestor of ancestorPaths(path)) {
+      addRows(this.ctx.storage.sql.exec<LockRecord>(
+        "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks WHERE path = ?1 AND depth = 'infinity'",
+        ancestor,
+      ));
+    }
+
+    if (includeDescendants) {
+      addRows(this.ctx.storage.sql.exec<LockRecord>(
+        "SELECT path, token, owner, scope, depth, expires_at AS expiresAt FROM locks WHERE path LIKE ?1",
+        `${withTrailingSlash(path)}%`,
+      ));
+    }
+
+    return [...candidates.values()];
   }
 }
 
@@ -189,6 +215,16 @@ function normalizeLockPath(path: string) {
     return "/";
   }
   return `/${path.split("/").filter(Boolean).join("/")}`;
+}
+
+function ancestorPaths(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  const ancestors = ["/"];
+  while (parts.length > 1) {
+    parts.pop();
+    ancestors.push(`/${parts.join("/")}`);
+  }
+  return ancestors;
 }
 
 function withTrailingSlash(path: string) {

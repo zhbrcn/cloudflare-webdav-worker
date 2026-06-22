@@ -22,6 +22,15 @@ interface AuthAttemptRecord {
   updatedAt: number;
 }
 
+interface AuditEventRecord {
+  [key: string]: SqlStorageValue;
+  id: number;
+  ts: number;
+  actor: string;
+  action: string;
+  target: string;
+}
+
 interface PublicUser {
   username: string;
   root: string;
@@ -110,6 +119,10 @@ export class WebDavUserManager {
 
       if (method === "GET" && url.pathname === "/users") {
         return Response.json({ ok: true, users: this.listUsers() });
+      }
+
+      if (method === "GET" && url.pathname === "/audit") {
+        return Response.json({ ok: true, events: this.listAuditEvents() });
       }
 
       if (method === "POST" && url.pathname === "/users/create") {
@@ -314,9 +327,7 @@ export class WebDavUserManager {
     const actor = normalizeAuditValue(actorInput || "unknown", 160);
     const action = normalizeAuditValue(actionInput || "unknown", 80);
     const target = normalizeAuditValue(targetInput || "", 160);
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)",
-    );
+    this.ensureAuditSchema();
     this.ctx.storage.sql.exec(
       "INSERT INTO audit_events (ts, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
       Date.now(),
@@ -328,6 +339,23 @@ export class WebDavUserManager {
       "DELETE FROM audit_events WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT 500)",
     );
     return { ok: true, status: 200 as const };
+  }
+
+  private listAuditEvents() {
+    this.ensureAuditSchema();
+    const events: AuditEventRecord[] = [];
+    for (const row of this.ctx.storage.sql.exec<AuditEventRecord>(
+      "SELECT id, ts, actor, action, target FROM audit_events ORDER BY id DESC LIMIT 100",
+    )) {
+      events.push(row);
+    }
+    return events;
+  }
+
+  private ensureAuditSchema() {
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)",
+    );
   }
 
   private checkRateLimit(key: string) {
