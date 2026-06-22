@@ -975,7 +975,7 @@ function renderSharedStyles() {
       align-items: center;
       justify-content: flex-end;
     }
-    .app-nav a, .nav-button {
+    .app-nav a {
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -988,15 +988,10 @@ function renderSharedStyles() {
       text-decoration: none;
       font-size: 12px;
     }
-    .app-nav a.is-active, .nav-button.is-active {
+    .app-nav a.is-active {
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
-    }
-    .nav-button[aria-disabled="true"] {
-      opacity: 0.5;
-      pointer-events: none;
-      cursor: default;
     }
     .page-heading {
       padding: 12px 16px 10px;
@@ -1199,20 +1194,83 @@ function renderSharedStyles() {
       font-size: 12px;
       text-transform: none;
     }
-    .breadcrumbs {
+    .file-context {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+    .context-line {
       display: flex;
       flex-wrap: wrap;
-      gap: 4px;
+      gap: 8px;
       align-items: center;
+      justify-content: space-between;
+    }
+    .account-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 3px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-soft);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .directory-meta {
       color: var(--muted);
       font-size: 12px;
     }
-    .breadcrumbs a {
+    .path-bar {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      min-width: 0;
+      min-height: 38px;
+      padding: 5px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-soft);
+      scrollbar-width: thin;
+    }
+    .path-segment {
+      flex: 0 0 auto;
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      max-width: min(280px, 58vw);
+      padding: 4px 8px;
+      border: 1px solid transparent;
+      border-radius: 5px;
       color: var(--link);
       font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    .breadcrumbs span {
+    .path-segment:hover {
+      border-color: var(--line);
+      background: var(--panel);
+      text-decoration: none;
+    }
+    .path-segment.is-current {
+      border-color: var(--line);
+      background: var(--panel);
+      color: var(--text);
+    }
+    .path-separator {
+      flex: 0 0 auto;
       color: var(--muted);
+    }
+    .selection-count {
+      display: inline-flex;
+      align-items: center;
+      min-height: 26px;
+      padding: 4px 6px;
+      color: var(--muted);
+      font-size: 12px;
     }
     .empty-state {
       padding: 40px 16px;
@@ -1240,6 +1298,9 @@ function renderSharedStyles() {
       body { padding: 6px; }
       .app-topbar, .header-row, .toolbar { align-items: flex-start; }
       .app-topbar { display: grid; }
+      .toolbar { display: grid; justify-content: stretch; }
+      .toolbar-group { width: 100%; }
+      .search-input { flex: 1 1 180px; min-width: 0; }
       th, td { padding: 7px 8px; }
       h1 { font-size: 16px; }
     }`;
@@ -1257,27 +1318,29 @@ function renderAppTopbar(active: "files" | "users", filesHref = "/") {
       </div>`;
 }
 
-function renderBreadcrumbs(auth: AuthContext, clientPath: string) {
+function renderPathBar(auth: AuthContext, clientPath: string, itemCount: number) {
   const relativePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
   const parts = relativePath.split("/").filter(Boolean);
   const rootHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
-  const items = [`<a href="${escapeHtml(rootHref)}">Root</a>`];
+  const accountLabel = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`) ? `Admin: ${auth.username}` : auth.username;
+  const itemLabel = `${itemCount} ${itemCount === 1 ? "item" : "items"}`;
+  const items = [
+    `<a class="path-segment ${parts.length === 0 ? "is-current" : ""}" href="${escapeHtml(rootHref)}" ${parts.length === 0 ? 'aria-current="page"' : ""}>/</a>`,
+  ];
   let current = "";
-  for (const part of parts) {
+  for (const [index, part] of parts.entries()) {
     current = `${current}/${part}`;
     const href = auth.mountPath === "/" ? encodePathForHref(current) : `${auth.mountPath}${encodePathForHref(current)}`;
-    items.push(`<span>/</span><a href="${escapeHtml(ensureHref(href, true))}">${escapeHtml(part)}</a>`);
+    const isCurrent = index === parts.length - 1;
+    items.push(`<span class="path-separator">/</span><a class="path-segment ${isCurrent ? "is-current" : ""}" href="${escapeHtml(ensureHref(href, true))}" title="${escapeHtml(part)}" ${isCurrent ? 'aria-current="page"' : ""}>${escapeHtml(part)}</a>`);
   }
-  return `<nav class="breadcrumbs" aria-label="Breadcrumbs">${items.join("")}</nav>`;
-}
-
-function parentHref(auth: AuthContext, clientPath: string) {
-  if (auth.mountPath === "/") {
-    return encodePathForHref(parentPath(clientPath));
-  }
-  const relative = stripPathPrefix(clientPath, auth.mountPath);
-  const parent = parentPath(relative);
-  return parent === "/" ? `${auth.mountPath}/` : `${auth.mountPath}${encodePathForHref(parent)}/`;
+  return `<section class="file-context" aria-label="Current directory">
+          <div class="context-line">
+            <span class="account-pill">${escapeHtml(accountLabel)}</span>
+            <span class="directory-meta">${escapeHtml(itemLabel)}</span>
+          </div>
+          <nav class="path-bar" aria-label="Directory path">${items.join("")}</nav>
+        </section>`;
 }
 
 function renderResourceIcon(isCollection: boolean, label: string) {
@@ -1291,15 +1354,12 @@ function renderResourceIcon(isCollection: boolean, label: string) {
 function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: AuthContext) {
   const clientPath = toClientPath(auth, path);
   const visiblePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
-  const title = clientPath === "/" ? "/" : clientPath;
   const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
-  const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
-  const pageSubtitle = isAdminFileView ? title : "WebDAV file manager";
+  const pageTitle = "Files";
+  const pageSubtitle = isAdminFileView ? auth.username : "WebDAV file manager";
   const currentDirectoryHref = toClientHref(auth, path, true);
   const homeHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
-  const upHref = parentHref(auth, clientPath);
-  const atRoot = isVisibleRoot(auth, path);
-  const breadcrumbs = renderBreadcrumbs(auth, clientPath);
+  const pathBar = renderPathBar(auth, clientPath, resources.length);
   const emptyRow = resources.length === 0
     ? `<tr><td colspan="5"><div class="empty-state">This directory is empty. Upload files or create a folder to start.</div></td></tr>`
     : "";
@@ -1333,10 +1393,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       </tr>`;
     })
     .join("");
-  const parentRow = isVisibleRoot(auth, path)
-    ? ""
-    : `<tr><td></td><td class="name"><div class="name-cell">${renderResourceIcon(true, "Parent directory")}<a class="name-text parent-link" href="${escapeHtml(parentHref(auth, clientPath))}">Parent Directory</a></div></td><td class="mono">-</td><td class="mono">-</td><td class="actions"></td></tr>`;
-
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -1372,6 +1428,11 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     }
     .search-input {
       min-width: min(260px, 100%);
+    }
+    .file-toolbar-label {
+      color: var(--muted);
+      font-size: 12px;
+      padding-right: 2px;
     }
     input[type="text"], textarea {
       width: 100%;
@@ -1472,14 +1533,51 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .parent-link {
-      display: inline-block;
-      padding: 2px 0;
-      font-weight: 600;
-    }
     .mono {
       font-family: Consolas, "SFMono-Regular", monospace;
       font-size: 12px;
+    }
+    @media (max-width: 720px) {
+      table, thead, tbody, tr, td {
+        display: block;
+      }
+      thead {
+        display: none;
+      }
+      tbody tr {
+        position: relative;
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      td {
+        border: 0;
+        padding: 3px 0;
+        white-space: normal;
+      }
+      td:first-child {
+        position: absolute;
+        top: 12px;
+        left: 10px;
+      }
+      td.name {
+        width: auto;
+        padding-left: 28px;
+        padding-right: 88px;
+      }
+      td.actions {
+        position: absolute;
+        top: 9px;
+        right: 10px;
+        width: auto;
+        min-width: 0;
+      }
+      td.mono {
+        padding-left: 28px;
+        color: var(--muted);
+      }
+      .action-menu-panel {
+        right: 0;
+      }
     }
     @media (max-width: 640px) {
       .table-wrap { max-height: none; }
@@ -1496,19 +1594,17 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
             <h1>${escapeHtml(pageTitle)}</h1>
             <p>${escapeHtml(pageSubtitle)}</p>
           </div>
-          ${breadcrumbs}
         </div>
+        ${pathBar}
         <div class="toolbar">
           <div class="toolbar-group">
-          <a class="nav-button" href="${escapeHtml(homeHref)}" aria-label="Go to root directory">Home</a>
-          <a class="nav-button" href="${escapeHtml(upHref)}" aria-disabled="${atRoot ? "true" : "false"}" ${atRoot ? 'tabindex="-1"' : ""} aria-label="Go to parent directory">Parent</a>
-          </div>
-          <div class="toolbar-group">
+          <span class="file-toolbar-label">Current folder</span>
           <label class="file-input-label primary" for="upload-input">Upload Files</label>
           <input id="upload-input" type="file" multiple>
           <button type="button" id="new-folder-button" class="primary">New Folder</button>
           </div>
           <div class="toolbar-group selection">
+          <span id="selection-count" class="selection-count">0 selected</span>
           <button type="button" id="select-all-button">Select All</button>
           <button type="button" id="invert-selection-button">Invert</button>
           <button type="button" id="move-selected-button">Move Selected</button>
@@ -1527,7 +1623,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         <thead>
           <tr><th></th><th>Name</th><th>Size</th><th>Modified</th><th>Actions</th></tr>
         </thead>
-        <tbody>${parentRow}${rows}${emptyRow}</tbody>
+        <tbody>${rows}${emptyRow}</tbody>
       </table>
     </section>
   </main>
@@ -1559,6 +1655,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     const invertSelectionButton = document.getElementById("invert-selection-button");
     const moveSelectedButton = document.getElementById("move-selected-button");
     const deleteSelectedButton = document.getElementById("delete-selected-button");
+    const selectionCount = document.getElementById("selection-count");
     const refreshButton = document.getElementById("refresh-button");
     const searchInput = document.getElementById("search-input");
     const editorModal = document.getElementById("editor-modal");
@@ -1676,6 +1773,19 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         name: row.dataset.name,
         isCollection: row.dataset.collection === "true",
       }));
+    }
+
+    function updateSelectionState() {
+      const count = selectedRows().length;
+      if (selectionCount) {
+        selectionCount.textContent = count + " selected";
+      }
+      if (moveSelectedButton) {
+        moveSelectedButton.disabled = count === 0;
+      }
+      if (deleteSelectedButton) {
+        deleteSelectedButton.disabled = count === 0;
+      }
     }
 
     async function renameResource(info) {
@@ -1800,6 +1910,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       rows.forEach((input) => {
         input.checked = shouldSelect;
       });
+      updateSelectionState();
       setStatus(shouldSelect ? "All items selected." : "Selection cleared.");
     }
 
@@ -1808,6 +1919,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       rows.forEach((input) => {
         input.checked = !input.checked;
       });
+      updateSelectionState();
       setStatus("Selection inverted.");
     }
 
@@ -1906,6 +2018,11 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
     });
     on(refreshButton, "click", () => location.reload());
+    on(tableBody, "change", (event) => {
+      if (event.target instanceof Element && event.target.matches(".row-select")) {
+        updateSelectionState();
+      }
+    });
     on(searchInput, "input", () => {
       const query = searchInput.value.trim().toLowerCase();
       document.querySelectorAll("tbody tr[data-href]").forEach((row) => {
@@ -1973,6 +2090,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
     });
 
+    updateSelectionState();
     setStatus("UI ready.");
   </script>
 </body>
