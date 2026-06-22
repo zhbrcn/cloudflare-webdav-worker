@@ -978,6 +978,7 @@ function renderSharedStyles() {
     .app-nav a, .nav-button {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       min-height: 26px;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -991,6 +992,11 @@ function renderSharedStyles() {
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
+    }
+    .nav-button[aria-disabled="true"] {
+      opacity: 0.5;
+      pointer-events: none;
+      cursor: default;
     }
     .page-heading {
       padding: 12px 16px 10px;
@@ -1239,12 +1245,12 @@ function renderSharedStyles() {
     }`;
 }
 
-function renderAppTopbar(active: "files" | "users") {
-  const filesHref = active === "users" ? `${ADMIN_PREFIX}/files` : "/";
+function renderAppTopbar(active: "files" | "users", filesHref = "/") {
+  const resolvedFilesHref = active === "users" ? `${ADMIN_PREFIX}/files` : filesHref;
   return `<div class="app-topbar">
         <div class="brand">WebDAV</div>
         <nav class="app-nav" aria-label="Primary">
-          <a href="${filesHref}" class="${active === "files" ? "is-active" : ""}">Files</a>
+          <a href="${escapeHtml(resolvedFilesHref)}" class="${active === "files" ? "is-active" : ""}">Files</a>
           <a href="${ADMIN_PREFIX}/users" class="${active === "users" ? "is-active" : ""}">Users</a>
           <a href="${ADMIN_PREFIX}/logout">Logout</a>
         </nav>
@@ -1290,6 +1296,9 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   const pageTitle = isAdminFileView ? `Files: ${auth.username}` : `Index of ${title}`;
   const pageSubtitle = isAdminFileView ? title : "WebDAV file manager";
   const currentDirectoryHref = toClientHref(auth, path, true);
+  const homeHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
+  const upHref = parentHref(auth, clientPath);
+  const atRoot = isVisibleRoot(auth, path);
   const breadcrumbs = renderBreadcrumbs(auth, clientPath);
   const emptyRow = resources.length === 0
     ? `<tr><td colspan="5"><div class="empty-state">This directory is empty. Upload files or create a folder to start.</div></td></tr>`
@@ -1480,7 +1489,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
 <body>
   <main>
     <header>
-      ${renderAppTopbar("files")}
+      ${renderAppTopbar("files", homeHref)}
       <div class="page-heading">
         <div class="header-row">
           <div>
@@ -1490,6 +1499,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
           ${breadcrumbs}
         </div>
         <div class="toolbar">
+          <div class="toolbar-group">
+          <a class="nav-button" href="${escapeHtml(homeHref)}" aria-label="Go to root directory">Home</a>
+          <a class="nav-button" href="${escapeHtml(upHref)}" aria-disabled="${atRoot ? "true" : "false"}" ${atRoot ? 'tabindex="-1"' : ""} aria-label="Go to parent directory">Parent</a>
+          </div>
           <div class="toolbar-group">
           <label class="file-input-label primary" for="upload-input">Upload Files</label>
           <input id="upload-input" type="file" multiple>
