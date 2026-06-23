@@ -238,6 +238,9 @@ async function handleGetLike(request: Request, env: Env, auth: AuthContext, path
 async function handlePost(request: Request, env: Env, auth: AuthContext, path: string) {
   const url = new URL(request.url);
   if (url.searchParams.get("backup") === BACKUP_QUERY_VALUE) {
+    if (!validateSameOrigin(request)) {
+      return new Response("CSRF check failed", { status: 403, headers: baseHeaders() });
+    }
     return handleBackupDownload(request, env, auth, path);
   }
 
@@ -677,6 +680,9 @@ async function handleBackupDownload(request: Request, env: Env, auth: AuthContex
   let entries: { directories: BackupDirectoryEntry[]; files: BackupFileEntry[] };
   try {
     const selectedPaths = request.method.toUpperCase() === "POST" ? await parseBackupSelection(request, auth) : [];
+    if (request.method.toUpperCase() === "POST" && selectedPaths.length === 0) {
+      throw new HttpError(400, "No backup items selected");
+    }
     entries = selectedPaths.length > 0
       ? await collectSelectedBackupEntries(env, auth, path, selectedPaths)
       : await collectCurrentDirectoryBackupEntries(env, auth, path);
@@ -2355,13 +2361,15 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         return;
       }
       const items = selectedBackupItems();
-      setStatus(items.length > 0 ? "Preparing selected backup..." : "Preparing backup...");
-      const response = items.length > 0
-        ? await request("POST", backupUrl(), {
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items }),
-          })
-        : await request("GET", backupUrl());
+      if (items.length === 0) {
+        setStatus("Select one or more items to back up.", "error");
+        return;
+      }
+      setStatus("Preparing selected backup...");
+      const response = await request("POST", backupUrl(), {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items }),
+      });
       const originalName = readDownloadFilename(response, "webdav-backup.zip");
       const plainBytes = new Uint8Array(await response.arrayBuffer());
       setStatus("Encrypting backup...");
@@ -2989,22 +2997,6 @@ function rateLimitKey(request: Request, username: string) {
   return `${ip}|${username.toLowerCase()}`;
 }
 
-async function recordAdminAudit(env: Env, actor: string, action: string, target = "") {
-  await userStub(env).fetch("https://users/audit", {
-    method: "POST",
-    body: JSON.stringify({ actor, action, target }),
-  });
-}
-
-function auditTargetFromBody(body: string) {
-  try {
-    const parsed = JSON.parse(body) as { username?: unknown };
-    return typeof parsed.username === "string" ? parsed.username : "";
-  } catch {
-    return "";
-  }
-}
-
 function requirePermission(auth: AuthContext, permission: Permission) {
   if (auth.permissions.has(permission)) {
     return null;
@@ -3051,37 +3043,28 @@ async function handleAdminRequest(request: Request, env: Env, auth: AuthContext,
     return proxyUserManager(env, "/users", "GET");
   }
 
-  if (path === `${ADMIN_PREFIX}/api/audit` && method === "GET") {
-    return proxyUserManager(env, "/audit", "GET");
-  }
-
   if (path === `${ADMIN_PREFIX}/api/users/create` && method === "POST") {
     const body = await request.text();
-    await recordAdminAudit(env, auth.username, "user.create", auditTargetFromBody(body));
     return proxyUserManager(env, "/users/create", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/update` && method === "POST") {
     const body = await request.text();
-    await recordAdminAudit(env, auth.username, "user.update", auditTargetFromBody(body));
     return proxyUserManager(env, "/users/update", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/reset-password` && method === "POST") {
     const body = await request.text();
-    await recordAdminAudit(env, auth.username, "user.reset-password", auditTargetFromBody(body));
     return proxyUserManager(env, "/users/reset-password", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/reveal-password` && method === "POST") {
     const body = await request.text();
-    await recordAdminAudit(env, auth.username, "user.reveal-password", auditTargetFromBody(body));
     return proxyUserManager(env, "/users/reveal-password", "POST", body);
   }
 
   if (path === `${ADMIN_PREFIX}/api/users/delete` && method === "POST") {
     const body = await request.text();
-    await recordAdminAudit(env, auth.username, "user.delete", auditTargetFromBody(body));
     return proxyUserManager(env, "/users/delete", "POST", body);
   }
 

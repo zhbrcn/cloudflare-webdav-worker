@@ -22,15 +22,6 @@ interface AuthAttemptRecord {
   updatedAt: number;
 }
 
-interface AuditEventRecord {
-  [key: string]: SqlStorageValue;
-  id: number;
-  ts: number;
-  actor: string;
-  action: string;
-  target: string;
-}
-
 interface PublicUser {
   username: string;
   root: string;
@@ -60,7 +51,7 @@ interface UpdateUserPayload {
 }
 
 const DEFAULT_PERMISSIONS: Permission[] = ["read", "write", "delete"];
-const PASSWORD_ITERATIONS = 100000;
+const PASSWORD_ITERATIONS = 210000;
 
 interface Env {
   PASSWORD_SECRET?: string;
@@ -121,10 +112,6 @@ export class WebDavUserManager {
         return Response.json({ ok: true, users: this.listUsers() });
       }
 
-      if (method === "GET" && url.pathname === "/audit") {
-        return Response.json({ ok: true, events: this.listAuditEvents() });
-      }
-
       if (method === "POST" && url.pathname === "/users/create") {
         const payload = (await request.json()) as CreateUserPayload;
         return Response.json(await this.createUser(payload));
@@ -150,11 +137,6 @@ export class WebDavUserManager {
         return Response.json(this.deleteUser(payload.username));
       }
 
-      if (method === "POST" && url.pathname === "/audit") {
-        const payload = (await request.json()) as { actor?: string; action?: string; target?: string };
-        return Response.json(this.recordAuditEvent(payload.actor, payload.action, payload.target));
-      }
-
       return new Response("Not found", { status: 404 });
     } catch (error) {
       void error;
@@ -175,8 +157,7 @@ export class WebDavUserManager {
       this.recordAuthFailure(rateLimitKey);
       return { ok: false, status: 401 as const };
     }
-    const passwordHash = await hashPassword(password, user.salt);
-    if (!timingSafeEquals(passwordHash, user.passwordHash)) {
+    if (!(await verifyPassword(password, user.passwordHash, user.salt))) {
       this.recordAuthFailure(rateLimitKey);
       return { ok: false, status: 401 as const };
     }
@@ -323,41 +304,6 @@ export class WebDavUserManager {
     return { ok: true, status: 200 as const };
   }
 
-  private recordAuditEvent(actorInput?: string, actionInput?: string, targetInput?: string) {
-    const actor = normalizeAuditValue(actorInput || "unknown", 160);
-    const action = normalizeAuditValue(actionInput || "unknown", 80);
-    const target = normalizeAuditValue(targetInput || "", 160);
-    this.ensureAuditSchema();
-    this.ctx.storage.sql.exec(
-      "INSERT INTO audit_events (ts, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
-      Date.now(),
-      actor,
-      action,
-      target,
-    );
-    this.ctx.storage.sql.exec(
-      "DELETE FROM audit_events WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT 500)",
-    );
-    return { ok: true, status: 200 as const };
-  }
-
-  private listAuditEvents() {
-    this.ensureAuditSchema();
-    const events: AuditEventRecord[] = [];
-    for (const row of this.ctx.storage.sql.exec<AuditEventRecord>(
-      "SELECT id, ts, actor, action, target FROM audit_events ORDER BY id DESC LIMIT 100",
-    )) {
-      events.push(row);
-    }
-    return events;
-  }
-
-  private ensureAuditSchema() {
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL)",
-    );
-  }
-
   private checkRateLimit(key: string) {
     this.cleanupAuthAttempts();
     const now = Date.now();
@@ -445,10 +391,6 @@ function normalizeRateLimitKey(value: string | undefined, username: string) {
   return raw.trim().toLowerCase().replace(/[^a-z0-9:._|/-]/g, "").slice(0, 180) || "unknown";
 }
 
-function normalizeAuditValue(value: string, maxLength: number) {
-  return value.replace(/[\r\n\t]/g, " ").trim().slice(0, maxLength);
-}
-
 function rootForUsername(username: string) {
   return `/${username}`;
 }
@@ -472,6 +414,17 @@ function parsePermissions(value: string) {
 }
 
 async function hashPassword(password: string, salt: string) {
+  return derivePasswordHash(password, salt, PASSWORD_ITERATIONS);
+}
+
+async function verifyPassword(password: string, storedHash: string, fallbackSalt: string) {
+  const iterations = parsePasswordIterations(storedHash) ?? PASSWORD_ITERATIONS;
+  const salt = parsePasswordSalt(storedHash) ?? fallbackSalt;
+  const candidate = await derivePasswordHash(password, salt, iterations);
+  return timingSafeEquals(candidate, storedHash);
+}
+
+async function derivePasswordHash(password: string, salt: string, iterations: number) {
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
@@ -479,12 +432,26 @@ async function hashPassword(password: string, salt: string) {
       name: "PBKDF2",
       hash: "SHA-256",
       salt: encoder.encode(salt),
-      iterations: PASSWORD_ITERATIONS,
+      iterations,
     },
     key,
     256,
   );
-  return `pbkdf2-sha256:${PASSWORD_ITERATIONS}:${salt}:${base64UrlEncode(new Uint8Array(bits))}`;
+  return `pbkdf2-sha256:${iterations}:${salt}:${base64UrlEncode(new Uint8Array(bits))}`;
+}
+
+function parsePasswordIterations(value: string) {
+  const parts = value.split(":");
+  if (parts[0] !== "pbkdf2-sha256" || parts.length < 4) {
+    return null;
+  }
+  const iterations = Number(parts[1]);
+  return Number.isSafeInteger(iterations) && iterations > 0 ? iterations : null;
+}
+
+function parsePasswordSalt(value: string) {
+  const parts = value.split(":");
+  return parts[0] === "pbkdf2-sha256" && parts.length >= 4 ? parts[2] : null;
 }
 
 async function encryptPassword(password: string, secret: string | undefined) {

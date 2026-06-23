@@ -1,5 +1,7 @@
 # Cloudflare WebDAV Worker
 
+Current release: `v2.0.0`
+
 Lightweight WebDAV server for Cloudflare Workers, backed by R2 for file storage and Durable Objects (SQLite) for lock and user management.
 
 This project is intended for small personal backups, app sync targets, and low-concurrency self-hosted WebDAV usage. It is not intended to be a fully RFC-complete or high-concurrency WebDAV server.
@@ -125,7 +127,7 @@ The browser UI is a convenience layer over the WebDAV endpoints. It is not inten
 
 ### Encrypted Backups
 
-Click `Encrypted Backup` in the browser file manager to download a self-decrypting HTML backup. If files or folders are selected, only those selected items are included; otherwise the current directory is included. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
+Select one or more files or folders in the browser file manager, then click `Encrypted Backup` to download a self-decrypting HTML backup. Only checked items are included. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
 
 Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 50 MiB before compression.
 
@@ -205,10 +207,11 @@ npm.cmd run deploy
 - If you need stronger access control, put the Worker behind Cloudflare Access.
 - This project uses Basic Auth and is intended for trusted personal or small-scale use.
 - Management write operations under `/_admin/*` require same-origin browser requests to reduce CSRF risk.
+- Encrypted backup creation from the browser also requires same-origin requests. The backup password is used only in the browser and is never sent to the Worker.
 - HTML responses include a restrictive Content Security Policy.
 - `/_admin/logout` redirects Cloudflare Access sessions to Access logout and returns `401` for Basic Auth sessions.
 - Managed-user Basic Auth failures are rate-limited after repeated bad passwords.
-- Sensitive admin actions such as password reveal, password reset, create, update, and delete are recorded in the User Durable Object audit log.
+- Managed-user passwords are hashed with PBKDF2-SHA256 before storage.
 
 ## Known Limitations
 
@@ -218,6 +221,7 @@ npm.cmd run deploy
 - `MOVE` / `COPY` safety is improved, but multi-object replacements are still not truly atomic
 - Client compatibility varies; test your target client before relying on it
 - Browser editing is intended for text files, not binary formats
+- Browser backup creation is intended for selected small configuration folders, not whole-bucket archival.
 
 ## Project Files
 
@@ -238,11 +242,10 @@ npm.cmd run deploy
 - set final `BASIC_AUTH_PASS`
 - set final `ADMIN_AUTH_USER`
 - set final `ADMIN_AUTH_PASS`
-- set final `ACCESS_ADMIN_EMAIL`
-- set final `ACCESS_TEAM_DOMAIN`
-- set final `ACCESS_AUD`
 - set final `PASSWORD_SECRET`
-- run `npm.cmd run check`
+- if using Cloudflare Access, set final `ACCESS_ADMIN_EMAIL`, `ACCESS_TEAM_DOMAIN`, and `ACCESS_AUD`
+- run `npm run check`
 - run `npm run dry-run`
+- run production smoke checks against the target deployment
 - run `npm run smoke`
 - run `npm.cmd run deploy`
