@@ -38,7 +38,7 @@ let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number 
 
 const BACKUP_QUERY_VALUE = "zip";
 const BACKUP_MAX_FILES = 2000;
-const BACKUP_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
+const BACKUP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
 
 interface BackupFileEntry {
   path: string;

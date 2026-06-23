@@ -127,7 +127,7 @@ The browser UI is a convenience layer over the WebDAV endpoints. It is not inten
 
 Click `Encrypted Backup` in the browser file manager to download the current directory as a self-decrypting HTML backup. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
 
-Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 200 MiB before compression.
+Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 50 MiB before compression.
 
 To restore on another machine, open the downloaded `.html` file in a browser, enter the backup password, and save the generated `.zip` file. Windows Explorer and 7-Zip can open the ZIP directly.
 
