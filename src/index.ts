@@ -689,7 +689,7 @@ async function collectBackupEntries(env: Env, auth: AuthContext, rootPath: strin
   async function visitDirectory(storagePath: string, relativeBase: string) {
     const children = await listChildren(env, storagePath);
     for (const child of children) {
-      if (!isSameOrDescendantPath(child.path, rootPath)) {
+      if (!isSameOrDescendantPath(rootPath, child.path)) {
         continue;
       }
 
