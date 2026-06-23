@@ -38,7 +38,7 @@ let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number 
 
 const BACKUP_QUERY_VALUE = "zip";
 const BACKUP_MAX_FILES = 2000;
-const BACKUP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
+const BACKUP_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
 
 interface BackupFileEntry {
   path: string;
@@ -663,7 +663,16 @@ async function handleBackupDownload(env: Env, auth: AuthContext, path: string, r
     return new Response("Backup target must be a collection", { status: 400, headers: baseHeaders() });
   }
 
-  const { directories, files } = await collectBackupEntries(env, auth, path, resource.lastModified);
+  let entries: { directories: BackupDirectoryEntry[]; files: BackupFileEntry[] };
+  try {
+    entries = await collectBackupEntries(env, auth, path, resource.lastModified);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return new Response(error.message, { status: error.status, headers: baseHeaders() });
+    }
+    throw error;
+  }
+  const { directories, files } = entries;
   const zip = createZipArchive(directories, files);
   const clientPath = toClientPath(auth, path);
   const filenameBase = backupFilenameBase(auth, clientPath);
@@ -2058,7 +2067,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       });
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(text || method + " " + href + " failed with " + response.status);
+        const message = text.includes("<html") || text.includes("<!DOCTYPE")
+          ? method + " " + href + " failed with " + response.status
+          : text;
+        throw new Error(message || method + " " + href + " failed with " + response.status);
       }
       return response;
     }
