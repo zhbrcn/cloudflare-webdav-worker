@@ -36,11 +36,9 @@ import {
 
 let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number } | null = null;
 
-const BACKUP_QUERY_VALUE = "tar.gz";
+const BACKUP_QUERY_VALUE = "zip";
 const BACKUP_MAX_FILES = 2000;
 const BACKUP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
-const TAR_BLOCK_SIZE = 512;
-const BACKUP_MAGIC = "CFWDAVBACKUP1\n";
 
 interface BackupFileEntry {
   path: string;
@@ -666,18 +664,17 @@ async function handleBackupDownload(env: Env, auth: AuthContext, path: string, r
   }
 
   const { directories, files } = await collectBackupEntries(env, auth, path, resource.lastModified);
-  const tar = createTarArchive(directories, files);
-  const gzip = await gzipBytes(tar);
+  const zip = createZipArchive(directories, files);
   const clientPath = toClientPath(auth, path);
   const filenameBase = backupFilenameBase(auth, clientPath);
 
-  return new Response(gzip, {
+  return new Response(zip, {
     status: 200,
     headers: {
       ...baseHeaders(),
-      "Content-Type": "application/gzip",
-      "Content-Disposition": `attachment; filename="${filenameBase}.tar.gz"`,
-      "Content-Length": String(gzip.byteLength),
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${filenameBase}.zip"`,
+      "Content-Length": String(zip.byteLength),
       "X-Backup-Files": String(files.length),
       "X-Backup-Uncompressed-Bytes": String(files.reduce((total, file) => total + file.size, 0)),
     },
@@ -731,97 +728,139 @@ async function collectBackupEntries(env: Env, auth: AuthContext, rootPath: strin
   return { directories, files };
 }
 
-function createTarArchive(directories: BackupDirectoryEntry[], files: BackupFileEntry[]) {
+function createZipArchive(directories: BackupDirectoryEntry[], files: BackupFileEntry[]) {
   const chunks: Uint8Array[] = [];
+  const centralDirectory: Uint8Array[] = [];
+  let offset = 0;
+
+  function addEntry(path: string, body: Uint8Array, mtime: Date | null, isDirectory: boolean) {
+    const name = isDirectory ? ensureZipDirectoryPath(path) : safeZipPath(path);
+    if (name === ".") {
+      return;
+    }
+    const nameBytes = new TextEncoder().encode(name);
+    const crc = isDirectory ? 0 : crc32(body);
+    const { time, date } = dosDateTime(mtime);
+    const local = zipLocalHeader(nameBytes, body.byteLength, crc, time, date);
+    const central = zipCentralHeader(nameBytes, body.byteLength, crc, time, date, offset, isDirectory);
+    chunks.push(local, body);
+    centralDirectory.push(central);
+    offset += local.byteLength + body.byteLength;
+  }
+
   for (const directory of directories) {
-    chunks.push(tarHeader(ensureTarDirectoryPath(directory.path), 0, directory.mtime, "5"));
+    addEntry(directory.path, new Uint8Array(), directory.mtime, true);
   }
   for (const file of files) {
-    chunks.push(tarHeader(safeTarPath(file.path), file.size, file.mtime, "0"));
-    chunks.push(file.body);
-    const padding = tarPadding(file.body.byteLength);
-    if (padding > 0) {
-      chunks.push(new Uint8Array(padding));
-    }
+    addEntry(file.path, file.body, file.mtime, false);
   }
-  chunks.push(new Uint8Array(TAR_BLOCK_SIZE * 2));
+
+  const centralOffset = offset;
+  for (const central of centralDirectory) {
+    chunks.push(central);
+    offset += central.byteLength;
+  }
+  chunks.push(zipEndOfCentralDirectory(centralDirectory.length, offset - centralOffset, centralOffset));
   return concatBytes(chunks);
 }
 
-function tarHeader(path: string, size: number, mtime: Date | null, typeflag: "0" | "5") {
-  const header = new Uint8Array(TAR_BLOCK_SIZE);
-  const name = safeTarPath(path);
-  const { nameField, prefixField } = splitTarName(name);
-  writeTarString(header, 0, 100, nameField);
-  writeTarOctal(header, 100, 8, typeflag === "5" ? 0o755 : 0o644);
-  writeTarOctal(header, 108, 8, 0);
-  writeTarOctal(header, 116, 8, 0);
-  writeTarOctal(header, 124, 12, size);
-  writeTarOctal(header, 136, 12, Math.floor((mtime?.getTime() ?? Date.now()) / 1000));
-  header.fill(0x20, 148, 156);
-  header[156] = typeflag.charCodeAt(0);
-  writeTarString(header, 257, 6, "ustar");
-  writeTarString(header, 263, 2, "00");
-  writeTarString(header, 265, 32, "root");
-  writeTarString(header, 297, 32, "root");
-  writeTarString(header, 345, 155, prefixField);
-  let checksum = 0;
-  for (const byte of header) {
-    checksum += byte;
-  }
-  writeTarOctal(header, 148, 8, checksum);
-  return header;
-}
-
-function safeTarPath(path: string) {
+function safeZipPath(path: string) {
   const parts = path.split("/").filter((part) => part && part !== "." && part !== "..");
   return parts.join("/") || ".";
 }
 
-function ensureTarDirectoryPath(path: string) {
-  const safe = safeTarPath(path);
+function ensureZipDirectoryPath(path: string) {
+  const safe = safeZipPath(path);
   return safe === "." ? "." : `${safe.replace(/\/+$/, "")}/`;
 }
 
-function splitTarName(path: string) {
-  const encoded = new TextEncoder().encode(path);
-  if (encoded.byteLength <= 100) {
-    return { nameField: path, prefixField: "" };
-  }
+function zipLocalHeader(nameBytes: Uint8Array, size: number, crc: number, time: number, date: number) {
+  const header = new Uint8Array(30 + nameBytes.byteLength);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x04034b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 0x0800, true);
+  view.setUint16(8, 0, true);
+  view.setUint16(10, time, true);
+  view.setUint16(12, date, true);
+  view.setUint32(14, crc, true);
+  view.setUint32(18, size, true);
+  view.setUint32(22, size, true);
+  view.setUint16(26, nameBytes.byteLength, true);
+  view.setUint16(28, 0, true);
+  header.set(nameBytes, 30);
+  return header;
+}
 
-  const parts = path.split("/");
-  for (let index = 1; index < parts.length; index += 1) {
-    const prefix = parts.slice(0, index).join("/");
-    const name = parts.slice(index).join("/");
-    if (new TextEncoder().encode(prefix).byteLength <= 155 && new TextEncoder().encode(name).byteLength <= 100) {
-      return { nameField: name, prefixField: prefix };
+function zipCentralHeader(
+  nameBytes: Uint8Array,
+  size: number,
+  crc: number,
+  time: number,
+  date: number,
+  offset: number,
+  isDirectory: boolean,
+) {
+  const header = new Uint8Array(46 + nameBytes.byteLength);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x02014b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, 20, true);
+  view.setUint16(8, 0x0800, true);
+  view.setUint16(10, 0, true);
+  view.setUint16(12, time, true);
+  view.setUint16(14, date, true);
+  view.setUint32(16, crc, true);
+  view.setUint32(20, size, true);
+  view.setUint32(24, size, true);
+  view.setUint16(28, nameBytes.byteLength, true);
+  view.setUint16(30, 0, true);
+  view.setUint16(32, 0, true);
+  view.setUint16(34, 0, true);
+  view.setUint16(36, 0, true);
+  view.setUint32(38, isDirectory ? 0x10 : 0, true);
+  view.setUint32(42, offset, true);
+  header.set(nameBytes, 46);
+  return header;
+}
+
+function zipEndOfCentralDirectory(entryCount: number, centralSize: number, centralOffset: number) {
+  const header = new Uint8Array(22);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, 0x06054b50, true);
+  view.setUint16(4, 0, true);
+  view.setUint16(6, 0, true);
+  view.setUint16(8, entryCount, true);
+  view.setUint16(10, entryCount, true);
+  view.setUint32(12, centralSize, true);
+  view.setUint32(16, centralOffset, true);
+  view.setUint16(20, 0, true);
+  return header;
+}
+
+function dosDateTime(dateInput: Date | null) {
+  const date = dateInput ?? new Date();
+  const year = Math.max(1980, date.getUTCFullYear());
+  const month = date.getUTCMonth() + 1;
+  const day = date.getUTCDate();
+  const hours = date.getUTCHours();
+  const minutes = date.getUTCMinutes();
+  const seconds = Math.floor(date.getUTCSeconds() / 2);
+  return {
+    time: (hours << 11) | (minutes << 5) | seconds,
+    date: ((year - 1980) << 9) | (month << 5) | day,
+  };
+}
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
     }
   }
-  throw new HttpError(400, "Backup contains a path that is too long for tar");
-}
-
-function writeTarString(header: Uint8Array, offset: number, length: number, value: string) {
-  const bytes = new TextEncoder().encode(value);
-  header.set(bytes.slice(0, length), offset);
-}
-
-function writeTarOctal(header: Uint8Array, offset: number, length: number, value: number) {
-  const text = value.toString(8).padStart(length - 1, "0").slice(-(length - 1));
-  writeTarString(header, offset, length, text);
-  header[offset + length - 1] = 0;
-}
-
-function tarPadding(length: number) {
-  return (TAR_BLOCK_SIZE - (length % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
-}
-
-async function gzipBytes(bytes: Uint8Array) {
-  const input = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(input).set(bytes);
-  const response = new Response(
-    new Response(input).body?.pipeThrough(new CompressionStream("gzip")),
-  );
-  return new Uint8Array(await response.arrayBuffer());
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function concatBytes(chunks: Uint8Array[]) {
@@ -2055,7 +2094,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
 
     function backupUrl() {
       const separator = currentDirectory.includes("?") ? "&" : "?";
-      return currentDirectory + separator + "backup=tar.gz";
+      return currentDirectory + separator + "backup=zip";
     }
 
     function readDownloadFilename(response, fallback) {
@@ -2093,6 +2132,28 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       return bytes;
     }
 
+    function base64FromBytes(bytes) {
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let index = 0; index < bytes.byteLength; index += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    function selfDecryptingHtml(payloadBase64) {
+      return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+        '<title>WebDAV Backup</title><style>body{font:14px/1.5 system-ui,sans-serif;margin:24px;max-width:720px}input,button{font:inherit;padding:8px;margin:4px 0}input{width:100%;box-sizing:border-box}button{cursor:pointer}</style></head>' +
+        '<body><h1>WebDAV Backup</h1><p>Enter the backup password to decrypt this file and download the ZIP archive.</p>' +
+        '<input id="password" type="password" autocomplete="current-password" autofocus><br><button id="decrypt">Decrypt ZIP</button><p id="status"></p>' +
+        '<script>const payload="' + payloadBase64 + '";' +
+        'function bytesFromBase64(value){const binary=atob(value);const bytes=new Uint8Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);return bytes}' +
+        'function readU32(bytes,offset){return new DataView(bytes.buffer,bytes.byteOffset+offset,4).getUint32(0,false)}' +
+        'function download(bytes,name){const url=URL.createObjectURL(new Blob([bytes],{type:"application/zip"}));const a=document.createElement("a");a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}' +
+        'async function run(){const status=document.getElementById("status");try{status.textContent="Decrypting...";const bytes=bytesFromBase64(payload);const magic=new TextEncoder().encode("CFWDAVHTMLBACKUP1\\\\n");for(let i=0;i<magic.length;i++){if(bytes[i]!==magic[i])throw new Error("Invalid backup file")}const headerLength=readU32(bytes,magic.length);const headerStart=magic.length+4;const headerEnd=headerStart+headerLength;const header=JSON.parse(new TextDecoder().decode(bytes.subarray(headerStart,headerEnd)));const password=document.getElementById("password").value;if(!password)throw new Error("Password required");const salt=bytesFromBase64(header.salt);const iv=bytesFromBase64(header.iv);const keyMaterial=await crypto.subtle.importKey("raw",new TextEncoder().encode(password),"PBKDF2",false,["deriveKey"]);const key=await crypto.subtle.deriveKey({name:"PBKDF2",hash:"SHA-256",salt,iterations:header.iterations},keyMaterial,{name:"AES-GCM",length:256},false,["decrypt"]);const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv},key,bytes.subarray(headerEnd));download(new Uint8Array(plain),header.filename||"webdav-backup.zip");status.textContent="ZIP downloaded."}catch(error){status.textContent=error&&error.message?error.message:"Decrypt failed";}}' +
+        'document.getElementById("decrypt").addEventListener("click",run);document.getElementById("password").addEventListener("keydown",event=>{if(event.key==="Enter")run()});</' + 'script></body></html>';
+    }
+
     async function encryptBackup(plainBytes, password, originalName) {
       const salt = crypto.getRandomValues(new Uint8Array(16));
       const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -2123,7 +2184,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }));
       const cipherBytes = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plainBytes));
       return concatUint8Arrays([
-        new TextEncoder().encode(${safeJsonEmbed(BACKUP_MAGIC)}),
+        new TextEncoder().encode("CFWDAVHTMLBACKUP1\\n"),
         u32be(header.byteLength),
         header,
         cipherBytes,
@@ -2142,12 +2203,13 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       }
       setStatus("Preparing backup...");
       const response = await request("GET", backupUrl());
-      const originalName = readDownloadFilename(response, "webdav-backup.tar.gz");
+      const originalName = readDownloadFilename(response, "webdav-backup.zip");
       const plainBytes = new Uint8Array(await response.arrayBuffer());
       setStatus("Encrypting backup...");
       const encryptedBytes = await encryptBackup(plainBytes, password, originalName);
-      downloadBlob(encryptedBytes, originalName + ".enc", "application/octet-stream");
-      setStatus("Encrypted backup downloaded.", "success");
+      const html = new TextEncoder().encode(selfDecryptingHtml(base64FromBytes(encryptedBytes)));
+      downloadBlob(html, originalName.replace(/\\.zip$/i, "") + ".html", "text/html");
+      setStatus("Encrypted backup page downloaded.", "success");
     }
 
     function rowInfo(button) {

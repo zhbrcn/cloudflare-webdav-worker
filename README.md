@@ -118,23 +118,18 @@ Supported browser actions:
 - select all / invert selection
 - search/filter current directory
 - drag and drop upload
-- encrypted `.tar.gz.enc` backup downloads for the current directory
+- encrypted self-decrypting HTML backup downloads for the current directory
 - basic text editing with Ctrl/Cmd+S, unsaved-change prompts, and in-place save
 
 The browser UI is a convenience layer over the WebDAV endpoints. It is not intended to be a full replacement for dedicated sync clients.
 
 ### Encrypted Backups
 
-Click `Encrypted Backup` in the browser file manager to download the current directory as a compressed encrypted archive. The Worker builds a `.tar.gz` archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
+Click `Encrypted Backup` in the browser file manager to download the current directory as a self-decrypting HTML backup. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
 
 Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 50 MiB before compression.
 
-To decrypt on another machine:
-
-```bash
-node scripts/decrypt-backup.mjs webdav-backup-user.tar.gz.enc
-tar -xzf webdav-backup-user.tar.gz
-```
+To restore on another machine, open the downloaded `.html` file in a browser, enter the backup password, and save the generated `.zip` file. Windows Explorer and 7-Zip can open the ZIP directly.
 
 ## User Management
 
