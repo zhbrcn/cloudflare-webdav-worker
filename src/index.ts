@@ -97,6 +97,8 @@ export default {
         case "GET":
         case "HEAD":
           return handleGetLike(request, env, auth, resourcePath);
+        case "POST":
+          return handlePost(request, env, auth, resourcePath);
         case "PUT":
           return handlePut(request, env, auth, resourcePath);
         case "DELETE":
@@ -182,7 +184,7 @@ async function handleGetLike(request: Request, env: Env, auth: AuthContext, path
   if (resource.isCollection) {
     const url = new URL(request.url);
     if (request.method.toUpperCase() === "GET" && url.searchParams.get("backup") === BACKUP_QUERY_VALUE) {
-      return handleBackupDownload(env, auth, path, resource);
+      return handleBackupDownload(request, env, auth, path);
     }
 
     const children = await listChildren(env, path);
@@ -231,6 +233,18 @@ async function handleGetLike(request: Request, env: Env, auth: AuthContext, path
   }
 
   return new Response(object.body, { status: range ? 206 : 200, headers });
+}
+
+async function handlePost(request: Request, env: Env, auth: AuthContext, path: string) {
+  const url = new URL(request.url);
+  if (url.searchParams.get("backup") === BACKUP_QUERY_VALUE) {
+    return handleBackupDownload(request, env, auth, path);
+  }
+
+  return new Response("Method Not Allowed", {
+    status: 405,
+    headers: baseHeaders(),
+  });
 }
 
 async function handlePut(request: Request, env: Env, auth: AuthContext, path: string) {
@@ -654,18 +668,18 @@ async function listChildren(env: Env, path: string): Promise<ResourceInfo[]> {
   return items;
 }
 
-async function handleBackupDownload(env: Env, auth: AuthContext, path: string, resource: ResourceInfo) {
+async function handleBackupDownload(request: Request, env: Env, auth: AuthContext, path: string) {
   const permissionCheck = requirePermission(auth, "read");
   if (permissionCheck) {
     return permissionCheck;
   }
-  if (!resource.isCollection) {
-    return new Response("Backup target must be a collection", { status: 400, headers: baseHeaders() });
-  }
 
   let entries: { directories: BackupDirectoryEntry[]; files: BackupFileEntry[] };
   try {
-    entries = await collectBackupEntries(env, auth, path, resource.lastModified);
+    const selectedPaths = request.method.toUpperCase() === "POST" ? await parseBackupSelection(request, auth) : [];
+    entries = selectedPaths.length > 0
+      ? await collectSelectedBackupEntries(env, auth, path, selectedPaths)
+      : await collectCurrentDirectoryBackupEntries(env, auth, path);
   } catch (error) {
     if (error instanceof HttpError) {
       return new Response(error.message, { status: error.status, headers: baseHeaders() });
@@ -675,7 +689,7 @@ async function handleBackupDownload(env: Env, auth: AuthContext, path: string, r
   const { directories, files } = entries;
   const zip = createZipArchive(directories, files);
   const clientPath = toClientPath(auth, path);
-  const filenameBase = backupFilenameBase(auth, clientPath);
+  const filenameBase = backupFilenameBase(auth, clientPath, files.length, directories.length);
 
   return new Response(zip, {
     status: 200,
@@ -690,51 +704,172 @@ async function handleBackupDownload(env: Env, auth: AuthContext, path: string, r
   });
 }
 
-async function collectBackupEntries(env: Env, auth: AuthContext, rootPath: string, rootMtime: Date | null) {
-  const directories: BackupDirectoryEntry[] = [{ path: ".", mtime: rootMtime }];
-  const files: BackupFileEntry[] = [];
-  let totalBytes = 0;
-
-  async function visitDirectory(storagePath: string, relativeBase: string) {
-    const children = await listChildren(env, storagePath);
-    for (const child of children) {
-      if (!isSameOrDescendantPath(rootPath, child.path)) {
-        continue;
-      }
-
-      const relativePath = relativeBase ? `${relativeBase}/${child.name}` : child.name;
-      if (child.isCollection) {
-        directories.push({ path: relativePath, mtime: child.lastModified });
-        await visitDirectory(child.path, relativePath);
-        continue;
-      }
-
-      if (!child.key) {
-        continue;
-      }
-      if (files.length >= BACKUP_MAX_FILES) {
-        throw new HttpError(413, `Backup is limited to ${BACKUP_MAX_FILES} files`);
-      }
-      totalBytes += child.size;
-      if (totalBytes > BACKUP_MAX_UNCOMPRESSED_BYTES) {
-        throw new HttpError(413, `Backup is limited to ${formatSize(BACKUP_MAX_UNCOMPRESSED_BYTES)} before compression`);
-      }
-
-      const object = await env.WEBDAV_BUCKET.get(child.key);
-      if (!object) {
-        continue;
-      }
-      files.push({
-        path: relativePath,
-        body: new Uint8Array(await object.arrayBuffer()),
-        size: child.size,
-        mtime: child.lastModified,
-      });
-    }
+async function parseBackupSelection(request: Request, auth: AuthContext) {
+  let payload: { items?: unknown };
+  try {
+    payload = (await request.json()) as { items?: unknown };
+  } catch {
+    throw new HttpError(400, "Invalid backup selection");
+  }
+  if (!Array.isArray(payload.items)) {
+    return [];
   }
 
-  await visitDirectory(rootPath, "");
+  const paths: string[] = [];
+  for (const item of payload.items) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const url = new URL(item, "https://backup.local");
+    const clientPath = normalizeRequestPath(url.pathname);
+    const storagePath = toStoragePath(auth, clientPath);
+    if (!isSameOrDescendantPath(auth.root, storagePath)) {
+      throw new HttpError(400, "Backup selection is outside the account root");
+    }
+    paths.push(storagePath);
+  }
+  return Array.from(new Set(paths)).sort((a, b) => a.localeCompare(b));
+}
+
+async function collectCurrentDirectoryBackupEntries(env: Env, auth: AuthContext, rootPath: string) {
+  const resource = await statAuthPath(env, auth, rootPath);
+  if (!resource?.isCollection) {
+    throw new HttpError(400, "Backup target must be a collection");
+  }
+  return collectBackupEntries(env, rootPath, "", resource.lastModified);
+}
+
+async function collectSelectedBackupEntries(env: Env, auth: AuthContext, currentPath: string, selectedPaths: string[]) {
+  const directories: BackupDirectoryEntry[] = [];
+  const files: BackupFileEntry[] = [];
+  const seenDirectories = new Set<string>();
+  const seenFiles = new Set<string>();
+  const totals = { files: 0, bytes: 0 };
+
+  for (const selectedPath of selectedPaths) {
+    const resource = await statAuthPath(env, auth, selectedPath);
+    if (!resource) {
+      throw new HttpError(404, "Selected backup item not found");
+    }
+    const relativePath = backupSelectionRelativePath(currentPath, selectedPath);
+    await collectBackupResource(env, selectedPath, relativePath, resource, directories, files, seenDirectories, seenFiles, totals);
+  }
+
+  directories.sort((a, b) => a.path.localeCompare(b.path));
+  files.sort((a, b) => a.path.localeCompare(b.path));
   return { directories, files };
+}
+
+async function collectBackupEntries(env: Env, rootPath: string, relativeRoot: string, rootMtime: Date | null) {
+  const directories: BackupDirectoryEntry[] = [{ path: ".", mtime: rootMtime }];
+  const files: BackupFileEntry[] = [];
+  const seenDirectories = new Set([relativeRoot || "."]);
+  const seenFiles = new Set<string>();
+  const totals = { files: 0, bytes: 0 };
+  await collectBackupDirectory(env, rootPath, relativeRoot, rootPath, directories, files, seenDirectories, seenFiles, totals);
+  return { directories, files };
+}
+
+async function collectBackupResource(
+  env: Env,
+  storagePath: string,
+  relativePath: string,
+  resource: ResourceInfo,
+  directories: BackupDirectoryEntry[],
+  files: BackupFileEntry[],
+  seenDirectories: Set<string>,
+  seenFiles: Set<string>,
+  totals: { files: number; bytes: number },
+) {
+  if (resource.isCollection) {
+    const directoryPath = relativePath || ".";
+    if (!seenDirectories.has(directoryPath)) {
+      seenDirectories.add(directoryPath);
+      directories.push({ path: directoryPath, mtime: resource.lastModified });
+    }
+    await collectBackupDirectory(env, storagePath, relativePath, storagePath, directories, files, seenDirectories, seenFiles, totals);
+    return;
+  }
+
+  await collectBackupFile(env, resource, relativePath || resource.name, files, seenFiles, totals);
+}
+
+async function collectBackupDirectory(
+  env: Env,
+  storagePath: string,
+  relativeBase: string,
+  rootPath: string,
+  directories: BackupDirectoryEntry[],
+  files: BackupFileEntry[],
+  seenDirectories: Set<string>,
+  seenFiles: Set<string>,
+  totals: { files: number; bytes: number },
+) {
+  const children = await listChildren(env, storagePath);
+  for (const child of children) {
+    if (!isSameOrDescendantPath(rootPath, child.path)) {
+      continue;
+    }
+
+    const relativePath = relativeBase ? `${relativeBase}/${child.name}` : child.name;
+    if (child.isCollection) {
+      if (!seenDirectories.has(relativePath)) {
+        seenDirectories.add(relativePath);
+        directories.push({ path: relativePath, mtime: child.lastModified });
+      }
+      await collectBackupDirectory(env, child.path, relativePath, rootPath, directories, files, seenDirectories, seenFiles, totals);
+      continue;
+    }
+
+    await collectBackupFile(env, child, relativePath, files, seenFiles, totals);
+  }
+}
+
+async function collectBackupFile(
+  env: Env,
+  resource: ResourceInfo,
+  relativePath: string,
+  files: BackupFileEntry[],
+  seenFiles: Set<string>,
+  totals: { files: number; bytes: number },
+) {
+  if (!resource.key || seenFiles.has(relativePath)) {
+    return;
+  }
+  if (totals.files >= BACKUP_MAX_FILES) {
+    throw new HttpError(413, `Backup is limited to ${BACKUP_MAX_FILES} files`);
+  }
+  totals.bytes += resource.size;
+  if (totals.bytes > BACKUP_MAX_UNCOMPRESSED_BYTES) {
+    throw new HttpError(413, `Backup is limited to ${formatSize(BACKUP_MAX_UNCOMPRESSED_BYTES)} before compression`);
+  }
+
+  const object = await env.WEBDAV_BUCKET.get(resource.key);
+  if (!object) {
+    return;
+  }
+  seenFiles.add(relativePath);
+  totals.files += 1;
+  files.push({
+    path: relativePath,
+    body: new Uint8Array(await object.arrayBuffer()),
+    size: resource.size,
+    mtime: resource.lastModified,
+  });
+}
+
+function backupSelectionRelativePath(currentPath: string, selectedPath: string) {
+  if (selectedPath === currentPath) {
+    return basename(selectedPath) || ".";
+  }
+  if (currentPath === "/") {
+    return selectedPath.replace(/^\/+/, "");
+  }
+  const currentPrefix = currentPath.endsWith("/") ? currentPath : `${currentPath}/`;
+  if (selectedPath.startsWith(currentPrefix)) {
+    return selectedPath.slice(currentPrefix.length);
+  }
+  return selectedPath.replace(/^\/+/, "");
 }
 
 function createZipArchive(directories: BackupDirectoryEntry[], files: BackupFileEntry[]) {
@@ -883,9 +1018,11 @@ function concatBytes(chunks: Uint8Array[]) {
   return result;
 }
 
-function backupFilenameBase(auth: AuthContext, clientPath: string) {
+function backupFilenameBase(auth: AuthContext, clientPath: string, fileCount: number, directoryCount: number) {
   const visible = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
-  const suffix = visible === "/" ? auth.username : `${auth.username}-${visible.split("/").filter(Boolean).join("-")}`;
+  const suffix = visible === "/" && (fileCount > 0 || directoryCount > 1)
+    ? auth.username
+    : `${auth.username}-${visible.split("/").filter(Boolean).join("-") || "selection"}`;
   return `webdav-backup-${suffix.replace(/[^a-zA-Z0-9._-]+/g, "-") || "files"}`;
 }
 
@@ -2109,6 +2246,10 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       return currentDirectory + separator + "backup=zip";
     }
 
+    function selectedBackupItems() {
+      return selectedItems().map((item) => item.href);
+    }
+
     function readDownloadFilename(response, fallback) {
       const disposition = response.headers.get("Content-Disposition") || "";
       const match = disposition.match(/filename="([^"]+)"/i);
@@ -2213,8 +2354,14 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         setStatus("Backup passwords do not match.", "error");
         return;
       }
-      setStatus("Preparing backup...");
-      const response = await request("GET", backupUrl());
+      const items = selectedBackupItems();
+      setStatus(items.length > 0 ? "Preparing selected backup..." : "Preparing backup...");
+      const response = items.length > 0
+        ? await request("POST", backupUrl(), {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items }),
+          })
+        : await request("GET", backupUrl());
       const originalName = readDownloadFilename(response, "webdav-backup.zip");
       const plainBytes = new Uint8Array(await response.arrayBuffer());
       setStatus("Encrypting backup...");
@@ -2972,6 +3119,8 @@ async function handleAdminFilesRequest(request: Request, env: Env, path: string)
     case "GET":
     case "HEAD":
       return handleGetLike(request, env, auth, resourcePath);
+    case "POST":
+      return handlePost(request, env, auth, resourcePath);
     case "PUT":
       return handlePut(request, env, auth, resourcePath);
     case "DELETE":

@@ -125,7 +125,7 @@ The browser UI is a convenience layer over the WebDAV endpoints. It is not inten
 
 ### Encrypted Backups
 
-Click `Encrypted Backup` in the browser file manager to download the current directory as a self-decrypting HTML backup. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
+Click `Encrypted Backup` in the browser file manager to download a self-decrypting HTML backup. If files or folders are selected, only those selected items are included; otherwise the current directory is included. The Worker builds a ZIP archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
 
 Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 50 MiB before compression.
 
