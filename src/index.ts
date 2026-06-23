@@ -36,6 +36,24 @@ import {
 
 let accessJwksCache: { url: string; keys: AccessJsonWebKey[]; expiresAt: number } | null = null;
 
+const BACKUP_QUERY_VALUE = "tar.gz";
+const BACKUP_MAX_FILES = 2000;
+const BACKUP_MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024;
+const TAR_BLOCK_SIZE = 512;
+const BACKUP_MAGIC = "CFWDAVBACKUP1\n";
+
+interface BackupFileEntry {
+  path: string;
+  body: Uint8Array;
+  size: number;
+  mtime: Date | null;
+}
+
+interface BackupDirectoryEntry {
+  path: string;
+  mtime: Date | null;
+}
+
 export { WebDavLockManager, WebDavUserManager };
 
 export default {
@@ -164,6 +182,11 @@ async function handleGetLike(request: Request, env: Env, auth: AuthContext, path
   }
 
   if (resource.isCollection) {
+    const url = new URL(request.url);
+    if (request.method.toUpperCase() === "GET" && url.searchParams.get("backup") === BACKUP_QUERY_VALUE) {
+      return handleBackupDownload(env, auth, path, resource);
+    }
+
     const children = await listChildren(env, path);
     const body = renderDirectoryListing(path, children, auth);
     const headers = new Headers(htmlHeaders());
@@ -631,6 +654,191 @@ async function listChildren(env: Env, path: string): Promise<ResourceInfo[]> {
 
   items.sort((a, b) => a.href.localeCompare(b.href));
   return items;
+}
+
+async function handleBackupDownload(env: Env, auth: AuthContext, path: string, resource: ResourceInfo) {
+  const permissionCheck = requirePermission(auth, "read");
+  if (permissionCheck) {
+    return permissionCheck;
+  }
+  if (!resource.isCollection) {
+    return new Response("Backup target must be a collection", { status: 400, headers: baseHeaders() });
+  }
+
+  const { directories, files } = await collectBackupEntries(env, auth, path, resource.lastModified);
+  const tar = createTarArchive(directories, files);
+  const gzip = await gzipBytes(tar);
+  const clientPath = toClientPath(auth, path);
+  const filenameBase = backupFilenameBase(auth, clientPath);
+
+  return new Response(gzip, {
+    status: 200,
+    headers: {
+      ...baseHeaders(),
+      "Content-Type": "application/gzip",
+      "Content-Disposition": `attachment; filename="${filenameBase}.tar.gz"`,
+      "Content-Length": String(gzip.byteLength),
+      "X-Backup-Files": String(files.length),
+      "X-Backup-Uncompressed-Bytes": String(files.reduce((total, file) => total + file.size, 0)),
+    },
+  });
+}
+
+async function collectBackupEntries(env: Env, auth: AuthContext, rootPath: string, rootMtime: Date | null) {
+  const directories: BackupDirectoryEntry[] = [{ path: ".", mtime: rootMtime }];
+  const files: BackupFileEntry[] = [];
+  let totalBytes = 0;
+
+  async function visitDirectory(storagePath: string, relativeBase: string) {
+    const children = await listChildren(env, storagePath);
+    for (const child of children) {
+      if (!isSameOrDescendantPath(child.path, rootPath)) {
+        continue;
+      }
+
+      const relativePath = relativeBase ? `${relativeBase}/${child.name}` : child.name;
+      if (child.isCollection) {
+        directories.push({ path: relativePath, mtime: child.lastModified });
+        await visitDirectory(child.path, relativePath);
+        continue;
+      }
+
+      if (!child.key) {
+        continue;
+      }
+      if (files.length >= BACKUP_MAX_FILES) {
+        throw new HttpError(413, `Backup is limited to ${BACKUP_MAX_FILES} files`);
+      }
+      totalBytes += child.size;
+      if (totalBytes > BACKUP_MAX_UNCOMPRESSED_BYTES) {
+        throw new HttpError(413, `Backup is limited to ${formatSize(BACKUP_MAX_UNCOMPRESSED_BYTES)} before compression`);
+      }
+
+      const object = await env.WEBDAV_BUCKET.get(child.key);
+      if (!object) {
+        continue;
+      }
+      files.push({
+        path: relativePath,
+        body: new Uint8Array(await object.arrayBuffer()),
+        size: child.size,
+        mtime: child.lastModified,
+      });
+    }
+  }
+
+  await visitDirectory(rootPath, "");
+  return { directories, files };
+}
+
+function createTarArchive(directories: BackupDirectoryEntry[], files: BackupFileEntry[]) {
+  const chunks: Uint8Array[] = [];
+  for (const directory of directories) {
+    chunks.push(tarHeader(ensureTarDirectoryPath(directory.path), 0, directory.mtime, "5"));
+  }
+  for (const file of files) {
+    chunks.push(tarHeader(safeTarPath(file.path), file.size, file.mtime, "0"));
+    chunks.push(file.body);
+    const padding = tarPadding(file.body.byteLength);
+    if (padding > 0) {
+      chunks.push(new Uint8Array(padding));
+    }
+  }
+  chunks.push(new Uint8Array(TAR_BLOCK_SIZE * 2));
+  return concatBytes(chunks);
+}
+
+function tarHeader(path: string, size: number, mtime: Date | null, typeflag: "0" | "5") {
+  const header = new Uint8Array(TAR_BLOCK_SIZE);
+  const name = safeTarPath(path);
+  const { nameField, prefixField } = splitTarName(name);
+  writeTarString(header, 0, 100, nameField);
+  writeTarOctal(header, 100, 8, typeflag === "5" ? 0o755 : 0o644);
+  writeTarOctal(header, 108, 8, 0);
+  writeTarOctal(header, 116, 8, 0);
+  writeTarOctal(header, 124, 12, size);
+  writeTarOctal(header, 136, 12, Math.floor((mtime?.getTime() ?? Date.now()) / 1000));
+  header.fill(0x20, 148, 156);
+  header[156] = typeflag.charCodeAt(0);
+  writeTarString(header, 257, 6, "ustar");
+  writeTarString(header, 263, 2, "00");
+  writeTarString(header, 265, 32, "root");
+  writeTarString(header, 297, 32, "root");
+  writeTarString(header, 345, 155, prefixField);
+  let checksum = 0;
+  for (const byte of header) {
+    checksum += byte;
+  }
+  writeTarOctal(header, 148, 8, checksum);
+  return header;
+}
+
+function safeTarPath(path: string) {
+  const parts = path.split("/").filter((part) => part && part !== "." && part !== "..");
+  return parts.join("/") || ".";
+}
+
+function ensureTarDirectoryPath(path: string) {
+  const safe = safeTarPath(path);
+  return safe === "." ? "." : `${safe.replace(/\/+$/, "")}/`;
+}
+
+function splitTarName(path: string) {
+  const encoded = new TextEncoder().encode(path);
+  if (encoded.byteLength <= 100) {
+    return { nameField: path, prefixField: "" };
+  }
+
+  const parts = path.split("/");
+  for (let index = 1; index < parts.length; index += 1) {
+    const prefix = parts.slice(0, index).join("/");
+    const name = parts.slice(index).join("/");
+    if (new TextEncoder().encode(prefix).byteLength <= 155 && new TextEncoder().encode(name).byteLength <= 100) {
+      return { nameField: name, prefixField: prefix };
+    }
+  }
+  throw new HttpError(400, "Backup contains a path that is too long for tar");
+}
+
+function writeTarString(header: Uint8Array, offset: number, length: number, value: string) {
+  const bytes = new TextEncoder().encode(value);
+  header.set(bytes.slice(0, length), offset);
+}
+
+function writeTarOctal(header: Uint8Array, offset: number, length: number, value: number) {
+  const text = value.toString(8).padStart(length - 1, "0").slice(-(length - 1));
+  writeTarString(header, offset, length, text);
+  header[offset + length - 1] = 0;
+}
+
+function tarPadding(length: number) {
+  return (TAR_BLOCK_SIZE - (length % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+}
+
+async function gzipBytes(bytes: Uint8Array) {
+  const input = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(input).set(bytes);
+  const response = new Response(
+    new Response(input).body?.pipeThrough(new CompressionStream("gzip")),
+  );
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+function concatBytes(chunks: Uint8Array[]) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+function backupFilenameBase(auth: AuthContext, clientPath: string) {
+  const visible = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
+  const suffix = visible === "/" ? auth.username : `${auth.username}-${visible.split("/").filter(Boolean).join("-")}`;
+  return `webdav-backup-${suffix.replace(/[^a-zA-Z0-9._-]+/g, "-") || "files"}`;
 }
 
 async function ensureParentExists(env: Env, path: string) {
@@ -1678,6 +1886,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
           <label class="file-input-label primary" for="upload-input">Upload Files</label>
           <input id="upload-input" type="file" multiple>
           <button type="button" id="new-folder-button" class="primary">New Folder</button>
+          <button type="button" id="backup-button">Encrypted Backup</button>
           </div>
           <div class="toolbar-group selection">
           <span id="selection-count" class="selection-count">0 selected</span>
@@ -1730,6 +1939,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     const statusEl = document.getElementById("status");
     const uploadInput = document.getElementById("upload-input");
     const newFolderButton = document.getElementById("new-folder-button");
+    const backupButton = document.getElementById("backup-button");
     const selectAllButton = document.getElementById("select-all-button");
     const invertSelectionButton = document.getElementById("invert-selection-button");
     const moveSelectedButton = document.getElementById("move-selected-button");
@@ -1787,7 +1997,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       window.clearTimeout(statusTimer);
       statusEl.textContent = message;
       statusEl.dataset.tone = tone;
-      statusEl.dataset.loading = /ing\\b|Loading|Uploading|Moving|Deleting|Saving|Creating/.test(message) ? "true" : "false";
+      statusEl.dataset.loading = /ing\\b|Loading|Uploading|Moving|Deleting|Saving|Creating|Preparing|Encrypting|Downloading/.test(message) ? "true" : "false";
       statusEl.classList.add("is-visible");
       if (tone !== "error" && statusEl.dataset.loading !== "true") {
         statusTimer = window.setTimeout(() => setStatus(""), 2400);
@@ -1841,6 +2051,103 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
       await request("MKCOL", joinPath(currentDirectory, name));
       setStatus("Folder created.", "success");
       location.reload();
+    }
+
+    function backupUrl() {
+      const separator = currentDirectory.includes("?") ? "&" : "?";
+      return currentDirectory + separator + "backup=tar.gz";
+    }
+
+    function readDownloadFilename(response, fallback) {
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/i);
+      return match ? match[1] : fallback;
+    }
+
+    function downloadBlob(bytes, filename, type) {
+      const blob = new Blob([bytes], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function concatUint8Arrays(parts) {
+      const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+      const result = new Uint8Array(total);
+      let offset = 0;
+      for (const part of parts) {
+        result.set(part, offset);
+        offset += part.byteLength;
+      }
+      return result;
+    }
+
+    function u32be(value) {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value, false);
+      return bytes;
+    }
+
+    async function encryptBackup(plainBytes, password, originalName) {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const iterations = 310000;
+      const passwordKey = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(password),
+        "PBKDF2",
+        false,
+        ["deriveKey"],
+      );
+      const key = await crypto.subtle.deriveKey(
+        { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+        passwordKey,
+        { name: "AES-GCM", length: 256 },
+        false,
+        ["encrypt"],
+      );
+      const header = new TextEncoder().encode(JSON.stringify({
+        version: 1,
+        cipher: "AES-256-GCM",
+        kdf: "PBKDF2-SHA256",
+        iterations,
+        salt: btoa(String.fromCharCode(...salt)),
+        iv: btoa(String.fromCharCode(...iv)),
+        filename: originalName,
+        createdAt: new Date().toISOString(),
+      }));
+      const cipherBytes = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plainBytes));
+      return concatUint8Arrays([
+        new TextEncoder().encode(${safeJsonEmbed(BACKUP_MAGIC)}),
+        u32be(header.byteLength),
+        header,
+        cipherBytes,
+      ]);
+    }
+
+    async function encryptedBackup() {
+      const password = window.prompt("Backup encryption password");
+      if (!password) {
+        return;
+      }
+      const confirmation = window.prompt("Confirm backup encryption password");
+      if (confirmation !== password) {
+        setStatus("Backup passwords do not match.", "error");
+        return;
+      }
+      setStatus("Preparing backup...");
+      const response = await request("GET", backupUrl());
+      const originalName = readDownloadFilename(response, "webdav-backup.tar.gz");
+      const plainBytes = new Uint8Array(await response.arrayBuffer());
+      setStatus("Encrypting backup...");
+      const encryptedBytes = await encryptBackup(plainBytes, password, originalName);
+      downloadBlob(encryptedBytes, originalName + ".enc", "application/octet-stream");
+      setStatus("Encrypted backup downloaded.", "success");
     }
 
     function rowInfo(button) {
@@ -2090,6 +2397,13 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
         await createFolder();
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Folder creation failed.", "error");
+      }
+    });
+    on(backupButton, "click", async () => {
+      try {
+        await encryptedBackup();
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : "Backup failed.", "error");
       }
     });
 

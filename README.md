@@ -19,6 +19,7 @@ This project is intended for small personal backups, app sync targets, and low-c
 - `UNLOCK`
 - Browser directory listing and basic file management UI
 - Basic text file editing from the browser
+- Encrypted browser backup downloads for small configuration trees
 - Browser user management for per-app WebDAV accounts
 - Per-account directories derived from usernames
 - Per-account read/write/delete permissions
@@ -117,9 +118,23 @@ Supported browser actions:
 - select all / invert selection
 - search/filter current directory
 - drag and drop upload
+- encrypted `.tar.gz.enc` backup downloads for the current directory
 - basic text editing with Ctrl/Cmd+S, unsaved-change prompts, and in-place save
 
 The browser UI is a convenience layer over the WebDAV endpoints. It is not intended to be a full replacement for dedicated sync clients.
+
+### Encrypted Backups
+
+Click `Encrypted Backup` in the browser file manager to download the current directory as a compressed encrypted archive. The Worker builds a `.tar.gz` archive, then the browser encrypts it locally with AES-256-GCM using a password you enter. The backup password is not sent to the Worker and is not stored.
+
+Backups are intended for small configuration trees. A single backup is limited to 2,000 files and 50 MiB before compression.
+
+To decrypt on another machine:
+
+```bash
+node scripts/decrypt-backup.mjs webdav-backup-user.tar.gz.enc
+tar -xzf webdav-backup-user.tar.gz
+```
 
 ## User Management
 
