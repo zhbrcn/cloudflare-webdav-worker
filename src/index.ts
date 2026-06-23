@@ -1219,31 +1219,7 @@ function renderSharedStyles() {
     }
     .file-context {
       display: grid;
-      gap: 8px;
       min-width: 0;
-    }
-    .context-line {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .account-pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
-      padding: 3px 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--panel-soft);
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 650;
-    }
-    .directory-meta {
-      color: var(--muted);
-      font-size: 12px;
     }
     .path-bar {
       display: flex;
@@ -1355,13 +1331,11 @@ function renderAppTopbar(active: "files" | "users", title = "WebDAV") {
       </div>`;
 }
 
-function renderPathBar(auth: AuthContext, clientPath: string, itemCount: number) {
+function renderPathBar(auth: AuthContext, clientPath: string) {
   const relativePath = auth.mountPath === "/" ? clientPath : stripPathPrefix(clientPath, auth.mountPath);
   const parts = relativePath.split("/").filter(Boolean);
   const isAdminFileView = auth.mountPath.startsWith(`${ADMIN_PREFIX}/files/`);
   const rootHref = auth.mountPath === "/" ? "/" : `${auth.mountPath}/`;
-  const accountLabel = isAdminFileView ? `Managed files: ${auth.username}` : auth.username;
-  const itemLabel = `${itemCount} ${itemCount === 1 ? "item" : "items"}`;
   const items = isAdminFileView
     ? [
         `<a class="path-segment" href="${ADMIN_PREFIX}/users">Users</a>`,
@@ -1379,10 +1353,6 @@ function renderPathBar(auth: AuthContext, clientPath: string, itemCount: number)
     items.push(`<span class="path-separator">/</span><a class="path-segment ${isCurrent ? "is-current" : ""}" href="${escapeHtml(ensureHref(href, true))}" title="${escapeHtml(part)}" ${isCurrent ? 'aria-current="page"' : ""}>${escapeHtml(part)}</a>`);
   }
   return `<section class="file-context" aria-label="Current directory">
-          <div class="context-line">
-            <span class="account-pill">${escapeHtml(accountLabel)}</span>
-            <span class="directory-meta">${escapeHtml(itemLabel)}</span>
-          </div>
           <nav class="path-bar" aria-label="Directory path">${items.join("")}</nav>
         </section>`;
 }
@@ -1402,7 +1372,7 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
   const pageTitle = "Files";
   const pageSubtitle = isAdminFileView ? auth.username : "WebDAV file manager";
   const currentDirectoryHref = toClientHref(auth, path, true);
-  const pathBar = renderPathBar(auth, clientPath, resources.length);
+  const pathBar = renderPathBar(auth, clientPath);
   const emptyRow = resources.length === 0
     ? `<tr><td colspan="5"><div class="empty-state">This directory is empty. Upload files or create a folder to start.</div></td></tr>`
     : "";
@@ -1626,15 +1596,6 @@ function renderDirectoryListing(path: string, resources: ResourceInfo[], auth: A
     @media (max-width: 720px) {
       .file-list-header {
         padding: 8px 10px;
-      }
-      .context-line {
-        display: grid;
-        gap: 4px;
-        justify-content: stretch;
-      }
-      .account-pill,
-      .directory-meta {
-        width: fit-content;
       }
       .path-bar {
         min-height: 36px;
@@ -2703,6 +2664,11 @@ function renderAdminUsersPage() {
   <title>WebDAV Admin</title>
   <style>
     ${renderSharedStyles()}
+    .admin-app {
+      min-height: calc(100vh - 24px);
+      display: flex;
+      flex-direction: column;
+    }
     .form {
       padding: 14px 16px;
       border-bottom: 1px solid var(--line);
@@ -2719,8 +2685,10 @@ function renderAdminUsersPage() {
       overflow-x: auto;
     }
     .admin-grid {
+      flex: 1;
       display: grid;
       gap: 0;
+      min-height: 0;
     }
     .password-box {
       margin: 14px 16px;
@@ -2733,23 +2701,6 @@ function renderAdminUsersPage() {
     }
     .password-box.is-visible { display: grid; }
     .password-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .audit-section {
-      border-top: 1px solid var(--line);
-      padding: 14px 16px 16px;
-      display: grid;
-      gap: 10px;
-    }
-    .audit-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .audit-header h2 {
-      margin: 0;
-      font-size: 15px;
-    }
     code {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -2811,7 +2762,6 @@ function renderAdminUsersPage() {
         min-width: 0;
       }
       .password-row button,
-      .audit-header button,
       .form button {
         width: 100%;
       }
@@ -2819,7 +2769,7 @@ function renderAdminUsersPage() {
   </style>
 </head>
 <body>
-  <main>
+  <main class="admin-app">
     <header>
       ${renderAppTopbar("users")}
       <div class="page-heading">
@@ -2876,29 +2826,11 @@ function renderAdminUsersPage() {
           <tbody id="users-body"></tbody>
         </table>
       </section>
-      <section class="audit-section">
-        <div class="audit-header">
-          <div>
-            <h2>Audit Log</h2>
-            <p>Recent sensitive account actions.</p>
-          </div>
-          <button type="button" id="refresh-audit-button">Refresh Audit</button>
-        </div>
-        <div class="admin-table-wrap">
-          <table class="admin-table audit-table">
-            <thead>
-              <tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th></tr>
-            </thead>
-            <tbody id="audit-body"></tbody>
-          </table>
-        </div>
-      </section>
     </div>
   </main>
   <script>
     const statusEl = document.getElementById("status");
     const usersBody = document.getElementById("users-body");
-    const auditBody = document.getElementById("audit-body");
     const passwordBox = document.getElementById("password-box");
     const generatedPassword = document.getElementById("generated-password");
     const togglePasswordButton = document.getElementById("toggle-password-button");
@@ -3008,18 +2940,6 @@ function renderAdminUsersPage() {
       setStatus("Users loaded.", "success");
     }
 
-    async function loadAudit() {
-      const result = await api("/audit");
-      auditBody.innerHTML = result.events.length ? result.events.map((event) => {
-        return '<tr>' +
-          '<td class="mono" data-label="Time">' + escapeHtml(fmtTime(event.ts)) + '</td>' +
-          '<td class="mono" data-label="Actor">' + escapeHtml(event.actor) + '</td>' +
-          '<td data-label="Action">' + escapeHtml(event.action) + '</td>' +
-          '<td class="mono" data-label="Target">' + escapeHtml(event.target || "-") + '</td>' +
-        '</tr>';
-      }).join("") : '<tr><td colspan="4"><div class="empty-state">No audit events yet.</div></td></tr>';
-    }
-
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
     }
@@ -3029,10 +2949,7 @@ function renderAdminUsersPage() {
       window.location.href = firstUser ? "/_admin/files/" + encodeURIComponent(firstUser) + "/" : "/";
     });
     document.getElementById("refresh-button").addEventListener("click", () => {
-      Promise.all([loadUsers(), loadAudit()]).catch((error) => setStatus(error.message, "error"));
-    });
-    document.getElementById("refresh-audit-button").addEventListener("click", () => {
-      loadAudit().catch((error) => setStatus(error.message, "error"));
+      loadUsers().catch((error) => setStatus(error.message, "error"));
     });
     document.getElementById("copy-password-button").addEventListener("click", async () => {
       await copyText(currentPassword, "Password");
@@ -3057,7 +2974,6 @@ function renderAdminUsersPage() {
         document.getElementById("password").value = "";
         setStatus("User created.", "success");
         await loadUsers();
-        await loadAudit();
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Create failed.", "error");
       }
@@ -3083,7 +2999,6 @@ function renderAdminUsersPage() {
           });
           setStatus("User saved.", "success");
           await loadUsers();
-          await loadAudit();
         }
         if (button.dataset.action === "files") {
           window.location.href = "/_admin/files/" + encodeURIComponent(username) + "/";
@@ -3097,7 +3012,6 @@ function renderAdminUsersPage() {
           const result = await api("/users/reveal-password", { method: "POST", body: { username } });
           showPassword(result.password);
           await copyText(result.password, "Password");
-          await loadAudit();
           return;
         }
         if (button.dataset.action === "reset") {
@@ -3107,7 +3021,6 @@ function renderAdminUsersPage() {
           const result = await api("/users/reset-password", { method: "POST", body: { username } });
           showPassword(result.password);
           setStatus("Password reset.", "success");
-          await loadAudit();
         }
         if (button.dataset.action === "delete") {
           if (!window.confirm("Delete user " + username + "?")) {
@@ -3116,14 +3029,13 @@ function renderAdminUsersPage() {
           await api("/users/delete", { method: "POST", body: { username } });
           setStatus("User deleted.", "success");
           await loadUsers();
-          await loadAudit();
         }
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "Action failed.", "error");
       }
     });
 
-    Promise.all([loadUsers(), loadAudit()]).catch((error) => setStatus(error.message, "error"));
+    loadUsers().catch((error) => setStatus(error.message, "error"));
   </script>
 </body>
 </html>`;

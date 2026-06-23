@@ -138,7 +138,6 @@ The admin page can:
 - delete users
 - assign read/write/delete permissions with checkboxes
 - browse and manage each user's files through the same browser file manager
-- review recent sensitive account actions in the audit log
 
 Managed user passwords are hashed for authentication and also stored as AES-GCM ciphertext so the Zero Trust-protected admin UI can copy them later. If `PASSWORD_SECRET` and the Durable Object data are both exposed, stored passwords can be recovered.
 
